@@ -41,7 +41,9 @@ def search_organism(name):
                         break
             if species:
                 break
-        hits.append({"id": bid, "name": species or name, "raw": strain})
+        has_assembly = bool(re.search(r"GC[AF]_\d{9,}", json.dumps(strain)))
+        hits.append({"id": bid, "name": species or name, "raw": strain, "has_assembly": has_assembly})
+    hits.sort(key=lambda x: (0 if x["has_assembly"] else 1))
     return hits
 
 def find_accession(strain_raw):
@@ -322,15 +324,29 @@ def check_organism():
         return jsonify({"error": f"BacDive hatasi: {str(e)}"}), 502
     if not hits:
         return jsonify({"found": False, "message": "BacDive'da kayit bulunamadi."})
-    best = hits[0]
-    bid = best["id"]
+    
+    # Tüm strainleri listele
+    strains = []
+    for h in hits:
+        accession = find_accession(h["raw"])
+        strains.append({
+            "bacdive_id": h["id"],
+            "bacdive_url": f"{BACDIVE_WEB}/{h['id']}",
+            "strain_name": h["name"],
+            "accession": accession,
+            "has_assembly": bool(accession),
+            "_strain": h["raw"],
+        })
+    
     return jsonify({
         "found": True,
-        "bacdive_id": bid,
-        "bacdive_url": f"{BACDIVE_WEB}/{bid}",
-        "strain_name": best["name"],
-        "total_hits": len(hits),
-        "_strain": best["raw"],
+        "total_hits": len(strains),
+        "strains": strains,
+        # Geriye uyumluluk için ilk strain bilgilerini de ver
+        "bacdive_id": strains[0]["bacdive_id"],
+        "bacdive_url": strains[0]["bacdive_url"],
+        "strain_name": strains[0]["strain_name"],
+        "_strain": strains[0]["_strain"],
     })
 
 

@@ -487,6 +487,7 @@ export default function App() {
   const [orgInput, setOrgInput] = useState("");
   const [orgLoading, setOrgLoading] = useState(false);
   const [orgResult, setOrgResult] = useState(null);
+  const [selectedStrain, setSelectedStrain] = useState(null);
   const [productInput, setProductInput] = useState("");
   const [productLoading, setProductLoading] = useState(false);
   const [productResult, setProductResult] = useState(null);
@@ -503,6 +504,7 @@ export default function App() {
       const data = await apiCheckOrganism(orgInput.trim());
       setOrgResult(data);
       if (data.found) {
+        setSelectedStrain(data.strains ? data.strains[0] : data);
         setStep(2);
         setTimeout(() => prodRef.current?.focus(), 400);
       }
@@ -514,11 +516,12 @@ export default function App() {
   }
 
   async function handleSearchProduct() {
-    if (!productInput.trim() || !orgResult?.bacdive_id) return;
+    const activeStrain = selectedStrain || orgResult;
+    if (!productInput.trim() || !activeStrain?.bacdive_id) return;
     setProductLoading(true);
     setProductResult(null);
     try {
-      const data = await apiSearchProduct(orgResult.bacdive_id, productInput.trim(), orgResult._strain);
+      const data = await apiSearchProduct(activeStrain.bacdive_id, productInput.trim(), activeStrain._strain);
       setProductResult(data);
     } catch (e) {
       setProductResult({ error: true, message: `Bağlantı hatası: ${e.message}` });
@@ -531,6 +534,7 @@ export default function App() {
     setStep(1);
     setOrgInput("");
     setOrgResult(null);
+    setSelectedStrain(null);
     setProductInput("");
     setProductResult(null);
     setTimeout(() => orgRef.current?.focus(), 100);
@@ -608,14 +612,72 @@ export default function App() {
 
             {orgResult?.found && (
               <div className="organism-result">
-                <div className="organism-result-name">{orgResult.strain_name}</div>
-                <div className="organism-meta">
-                  <div className="meta-item"><span className="meta-key">BacDive ID</span><span className="meta-val">{orgResult.bacdive_id}</span></div>
-                  <div className="meta-item"><span className="meta-key">Toplam kayıt</span><span className="meta-val">{orgResult.total_hits}</span></div>
+                <div style={{fontSize:"11px", color:"#4ade80", fontFamily:"IBM Plex Mono", marginBottom:"10px", letterSpacing:"0.05em"}}>
+                  {orgResult.total_hits} STRAIN BULUNDU — BİRİNİ SEÇ
                 </div>
-                <a className="bacdive-link" href={orgResult.bacdive_url} target="_blank" rel="noreferrer">
-                  <IconExternal /> {orgResult.bacdive_url}
-                </a>
+
+                {/* Assembly olanlar */}
+                {orgResult.strains?.filter(s => s.has_assembly).length > 0 && (
+                  <div style={{marginBottom:"12px"}}>
+                    <div style={{fontSize:"10px", color:"#4ade80", fontFamily:"IBM Plex Mono", marginBottom:"6px", opacity:0.7}}>✓ GENOME ASSEMBLY MEVCUT</div>
+                    {orgResult.strains.filter(s => s.has_assembly).map(s => (
+                      <div key={s.bacdive_id}
+                        onClick={() => { setSelectedStrain(s); setProductResult(null); }}
+                        style={{
+                          padding:"10px 14px", marginBottom:"6px", borderRadius:"6px", cursor:"pointer",
+                          border: selectedStrain?.bacdive_id === s.bacdive_id ? "1px solid #4ade80" : "1px solid rgba(74,222,128,0.2)",
+                          background: selectedStrain?.bacdive_id === s.bacdive_id ? "rgba(74,222,128,0.1)" : "rgba(74,222,128,0.03)",
+                          transition:"all 0.15s"
+                        }}>
+                        <div style={{color:"#e2e8f0", fontSize:"13px", fontWeight:"600", marginBottom:"4px"}}>{s.strain_name}</div>
+                        <div style={{display:"flex", gap:"12px", alignItems:"center", flexWrap:"wrap"}}>
+                          <span style={{fontSize:"11px", color:"#94a3b8"}}>BacDive ID: <span style={{color:"#4ade80"}}>{s.bacdive_id}</span></span>
+                          <span style={{fontSize:"11px", color:"#94a3b8"}}>Assembly: <span style={{color:"#60a5fa"}}>{s.accession}</span></span>
+                          <a href={s.bacdive_url} target="_blank" rel="noreferrer"
+                            onClick={e => e.stopPropagation()}
+                            style={{fontSize:"11px", color:"#94a3b8", textDecoration:"none", borderBottom:"1px dashed rgba(148,163,184,0.4)"}}>
+                            BacDive ↗
+                          </a>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Assembly olmayanlar */}
+                {orgResult.strains?.filter(s => !s.has_assembly).length > 0 && (
+                  <div>
+                    <div style={{fontSize:"10px", color:"#f59e0b", fontFamily:"IBM Plex Mono", marginBottom:"6px", opacity:0.7}}>⚠ GENOME ASSEMBLY YOK</div>
+                    {orgResult.strains.filter(s => !s.has_assembly).map(s => (
+                      <div key={s.bacdive_id}
+                        onClick={() => { setSelectedStrain(s); setProductResult(null); }}
+                        style={{
+                          padding:"10px 14px", marginBottom:"6px", borderRadius:"6px", cursor:"pointer",
+                          border: selectedStrain?.bacdive_id === s.bacdive_id ? "1px solid #f59e0b" : "1px solid rgba(245,158,11,0.2)",
+                          background: selectedStrain?.bacdive_id === s.bacdive_id ? "rgba(245,158,11,0.08)" : "rgba(245,158,11,0.02)",
+                          opacity: 0.8, transition:"all 0.15s"
+                        }}>
+                        <div style={{color:"#e2e8f0", fontSize:"13px", fontWeight:"600", marginBottom:"4px"}}>{s.strain_name}</div>
+                        <div style={{display:"flex", gap:"12px", alignItems:"center"}}>
+                          <span style={{fontSize:"11px", color:"#94a3b8"}}>BacDive ID: <span style={{color:"#f59e0b"}}>{s.bacdive_id}</span></span>
+                          <a href={s.bacdive_url} target="_blank" rel="noreferrer"
+                            onClick={e => e.stopPropagation()}
+                            style={{fontSize:"11px", color:"#94a3b8", textDecoration:"none", borderBottom:"1px dashed rgba(148,163,184,0.4)"}}>
+                            BacDive ↗
+                          </a>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {selectedStrain && (
+                  <div style={{marginTop:"10px", padding:"8px 12px", borderRadius:"4px", background:"rgba(74,222,128,0.05)", border:"1px solid rgba(74,222,128,0.15)"}}>
+                    <span style={{fontSize:"11px", color:"#4ade80", fontFamily:"IBM Plex Mono"}}>SEÇİLİ: </span>
+                    <span style={{fontSize:"11px", color:"#e2e8f0"}}>{selectedStrain.strain_name}</span>
+                    {selectedStrain.accession && <span style={{fontSize:"11px", color:"#60a5fa", marginLeft:"8px"}}>({selectedStrain.accession})</span>}
+                  </div>
+                )}
               </div>
             )}
           </div>
