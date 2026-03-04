@@ -1,7 +1,7 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useRef } from "react";
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
-const API_BASE = "http://localhost:5050";   // change to your backend URL
+const API_BASE = "https://deepdive-backend-6nza.onrender.com";
 const DEMO_MODE = false;                      // set false when backend is running
 
 // ─── DEMO DATA ─────────────────────────────────────────────────────────────
@@ -117,6 +117,7 @@ const IconLoader = () => (
   </svg>
 );
 
+// eslint-disable-next-line no-unused-vars
 const IconChevron = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
     <polyline points="9 18 15 12 9 6"/>

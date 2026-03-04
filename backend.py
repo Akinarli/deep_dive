@@ -371,5 +371,7 @@ def search_product():
 
 
 if __name__ == "__main__":
-    print("BacDive backend http://localhost:5050 adresinde calisiyor...")
-    app.run(host="0.0.0.0", port=5050, debug=False)
+    import os
+    port = int(os.environ.get("PORT", 5050))
+    print(f"BacDive backend http://localhost:{port} adresinde calisiyor...")
+    app.run(host="0.0.0.0", port=port, debug=False)
