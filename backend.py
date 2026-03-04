@@ -49,6 +49,49 @@ def find_accession(strain_raw):
     m = re.search(r"GC[AF]_\d{9,}(?:\.\d+)?", text)
     return m.group(0) if m else None
 
+def find_accession_via_ncbi(organism_name):
+    """
+    BacDive'da accession yoksa NCBI'dan organizma adıyla ara.
+    NCBI Assembly veritabanında en iyi eşleşen assembly'i bul.
+    """
+    try:
+        # NCBI Assembly'de organizma adıyla ara
+        es = requests.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+            params={
+                "db": "assembly",
+                "term": f"{organism_name}[Organism]",
+                "retmode": "json",
+                "retmax": 5,
+                "sort": "submissiondate desc"
+            },
+            timeout=15
+        )
+        if not es.ok:
+            return None
+        ids = es.json().get("esearchresult", {}).get("idlist", [])
+        if not ids:
+            return None
+
+        # En iyi assembly'i al
+        esummary = requests.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+            params={"db": "assembly", "id": ids[0], "retmode": "json"},
+            timeout=15
+        )
+        if not esummary.ok:
+            return None
+
+        doc = esummary.json().get("result", {}).get(ids[0], {})
+        
+        # GCF öncelikli, sonra GCA
+        accession = doc.get("assemblyaccession") or doc.get("synonym", {}).get("genbank")
+        print(f"[INFO] NCBI taxonomy aramasiyla accession bulundu: {accession} ({organism_name})")
+        return accession
+    except Exception as e:
+        print(f"[WARN] NCBI taxonomy arama hatasi: {e}")
+        return None
+
 # ─── DSMZ CDN'den GBFF indir ve parse et ─────────────────────────────────────
 
 def fetch_gbff_features(accession, product_query):
@@ -312,9 +355,26 @@ def search_product():
             pass
 
     if not accession:
+        # BacDive'da accession yoksa NCBI'dan organizma adıyla ara
+        strain_name = ""
+        if strain_raw:
+            for section in strain_raw.values():
+                if isinstance(section, dict):
+                    for f in ["species", "full_scientific_name", "full_name"]:
+                        if section.get(f):
+                            strain_name = section[f]
+                            break
+                if strain_name:
+                    break
+        
+        if strain_name:
+            print(f"[INFO] BacDive'da accession yok, NCBI taxonomy araması: {strain_name}")
+            accession = find_accession_via_ncbi(strain_name)
+    
+    if not accession:
         return jsonify({
             "found": False, "error_code": "NO_ASSEMBLY",
-            "message": "Bu BacDive kaydinda genome assembly accession bulunamadi.",
+            "message": "Bu BacDive kaydinda genome assembly accession bulunamadi ve NCBI'da da bulunamadi.",
         })
 
     # 1. DSMZ CDN'den GBFF indir (BacDive'ın kendi Bakta annotation'ı)
