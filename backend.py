@@ -6,20 +6,40 @@ import json
 import gzip
 import requests
 import urllib.parse
+import asyncio
+import aiohttp
+import threading
+import time
 
 app = Flask(__name__)
 CORS(app)
 
 BACDIVE_WEB = "https://bacdive.dsmz.de/strain"
-CDN_BASE = "https://cdn.dsmz.de/genomes"
-client = bacdive.BacdiveClient()
+CDN_BASE    = "https://cdn.dsmz.de/genomes"
+client      = bacdive.BacdiveClient()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Referer": "https://bacdive.dsmz.de/",
+    "Referer":    "https://bacdive.dsmz.de/",
 }
 
-# ─── BacDive organizma arama ─────────────────────────────────────────────────
+# ─── CACHE ───────────────────────────────────────────────────────────────────
+_cache = {}
+_cache_lock = threading.Lock()
+CACHE_TTL = 6 * 3600  # 6 saat
+
+def cache_get(key):
+    with _cache_lock:
+        e = _cache.get(key)
+        if e and time.time() - e["ts"] < CACHE_TTL:
+            return e["val"]
+    return None
+
+def cache_set(key, val):
+    with _cache_lock:
+        _cache[key] = {"val": val, "ts": time.time()}
+
+# ─── BacDive ─────────────────────────────────────────────────────────────────
 
 def search_organism(name):
     count = client.search(taxonomy=name)
@@ -52,188 +72,243 @@ def find_accession(strain_raw):
     return m.group(0) if m else None
 
 def find_accession_via_ncbi(organism_name):
-    """
-    BacDive'da accession yoksa NCBI'dan organizma adıyla ara.
-    NCBI Assembly veritabanında en iyi eşleşen assembly'i bul.
-    """
     try:
-        # NCBI Assembly'de organizma adıyla ara
         es = requests.get(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
-            params={
-                "db": "assembly",
-                "term": f"{organism_name}[Organism]",
-                "retmode": "json",
-                "retmax": 5,
-                "sort": "submissiondate desc"
-            },
-            timeout=15
-        )
+            params={"db": "assembly", "term": f"{organism_name}[Organism]",
+                    "retmode": "json", "retmax": 5, "sort": "submissiondate desc"},
+            timeout=15)
         if not es.ok:
             return None
         ids = es.json().get("esearchresult", {}).get("idlist", [])
         if not ids:
             return None
-
-        # En iyi assembly'i al
         esummary = requests.get(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
-            params={"db": "assembly", "id": ids[0], "retmode": "json"},
-            timeout=15
-        )
+            params={"db": "assembly", "id": ids[0], "retmode": "json"}, timeout=15)
         if not esummary.ok:
             return None
-
         doc = esummary.json().get("result", {}).get(ids[0], {})
-        
-        # GCF öncelikli, sonra GCA
-        accession = doc.get("assemblyaccession") or doc.get("synonym", {}).get("genbank")
-        print(f"[INFO] NCBI taxonomy aramasiyla accession bulundu: {accession} ({organism_name})")
-        return accession
+        return doc.get("assemblyaccession") or doc.get("synonym", {}).get("genbank")
     except Exception as e:
-        print(f"[WARN] NCBI taxonomy arama hatasi: {e}")
+        print(f"[WARN] NCBI taxonomy: {e}")
         return None
 
-# ─── DSMZ CDN'den GBFF indir ve parse et ─────────────────────────────────────
+# ─── PARSERS ─────────────────────────────────────────────────────────────────
 
-def fetch_gbff_features(accession, product_query):
-    """
-    BacDive'ın CDN'inden GBFF dosyasını indir ve product alanında ara.
-    URL formatı: https://cdn.dsmz.de/genomes/GCA_XXXXXXXXX.gbff
-    """
-    acc_base = accession.split(".")[0]
-    
-    # Farklı formatları dene
-    urls_to_try = [
-        f"{CDN_BASE}/{acc_base}.gbff",
-        f"{CDN_BASE}/{accession}.gbff",
-        f"{CDN_BASE}/{acc_base}.gbff.gz",
-        f"{CDN_BASE}/{accession}.gbff.gz",
-    ]
-    
-    content = None
-    used_url = None
-    
-    for url in urls_to_try:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=60)
-            if r.ok:
-                raw = r.content
-                if url.endswith(".gz"):
-                    content = gzip.decompress(raw).decode("utf-8", errors="replace")
-                else:
-                    content = raw.decode("utf-8", errors="replace")
-                used_url = url
-                print(f"[INFO] GBFF indirildi: {url} ({len(content)} chars)")
-                break
-        except Exception as e:
-            print(f"[WARN] {url} basarisiz: {e}")
-            continue
-    
-    if not content:
-        return None, "DSMZ CDN'den GBFF indirilemedi"
-    
-    # GBFF parse et
-    matches = parse_gbff(content, product_query)
-    return matches, None
-
-def parse_gbff(content, product_query):
-    """
-    GenBank flat file (GBFF) formatını parse et.
-    Her CDS/rRNA/tRNA feature'ı için product alanını kontrol et.
-    """
-    query_lc = product_query.lower()
+def parse_gbff(content, product_queries):
+    queries_lc = [q.lower().strip() for q in product_queries]
     matches = []
-    
-    # GBFF'de her feature bloğunu işle
-    # Format:
-    # FEATURES             Location/Qualifiers
-    #      CDS             complement(214100..217600)
-    #                      /locus_tag="Loc_01909"
-    #                      /gene="bcsC"
-    #                      /product="cellulose synthase complex outer membrane..."
-    
     current_feature = None
     current_attrs = {}
     current_location = ""
     current_contig = ""
-    
     lines = content.splitlines()
     i = 0
-    
+
+    def save():
+        if current_feature and current_attrs.get("product"):
+            product = current_attrs["product"]
+            mq = [q for q in queries_lc if q in product.lower()]
+            if mq:
+                loc = current_location
+                strand = "-" if "complement" in loc else "+"
+                coords = re.findall(r'\d+', loc)
+                matches.append({
+                    "locus_tag":     current_attrs.get("locus_tag", ""),
+                    "contig":        current_contig,
+                    "start":         coords[0] if coords else "",
+                    "stop":          coords[-1] if len(coords) > 1 else "",
+                    "strand":        strand,
+                    "type":          current_feature,
+                    "gene":          current_attrs.get("gene", ""),
+                    "product":       product,
+                    "protein_id":    current_attrs.get("protein_id", ""),
+                    "matched_query": mq[0],
+                })
+
     while i < len(lines):
         line = lines[i]
-        
-        # Contig/locus satırı
         if line.startswith("LOCUS"):
             parts = line.split()
             if len(parts) > 1:
                 current_contig = parts[1]
-        
-        # Feature satırı (5 boşlukla başlar, sonra feature tipi)
         feat_match = re.match(r'^     (\w+)\s+(.+)$', line)
         if feat_match:
-            # Önceki feature'ı kaydet
-            if current_feature and current_attrs.get("product"):
-                product = current_attrs.get("product", "")
-                if query_lc in product.lower():
-                    loc = current_location
-                    strand = "-" if "complement" in loc else "+"
-                    coords = re.findall(r'\d+', loc)
-                    start = coords[0] if coords else ""
-                    stop = coords[-1] if len(coords) > 1 else ""
-                    matches.append({
-                        "locus_tag": current_attrs.get("locus_tag", ""),
-                        "contig": current_contig,
-                        "start": start,
-                        "stop": stop,
-                        "strand": strand,
-                        "type": current_feature,
-                        "gene": current_attrs.get("gene", ""),
-                        "product": product,
-                    })
-            
-            current_feature = feat_match.group(1)
+            save()
+            current_feature  = feat_match.group(1)
             current_location = feat_match.group(2).strip()
-            current_attrs = {}
-        
-        # Attribute satırı (/key="value")
+            current_attrs    = {}
         elif line.startswith('                     /'):
             attr_line = line.strip().lstrip('/')
             if '="' in attr_line:
                 key, val = attr_line.split('="', 1)
                 val = val.rstrip('"')
-                # Çok satırlı değerleri birleştir
-                while i + 1 < len(lines) and not lines[i+1].strip().startswith('/') and not lines[i+1].strip().startswith('CDS') and lines[i+1].startswith('                     ') and not re.match(r'^     \w+\s+', lines[i+1]):
+                while (i + 1 < len(lines)
+                       and not lines[i+1].strip().startswith('/')
+                       and lines[i+1].startswith('                     ')
+                       and not re.match(r'^     \w+\s+', lines[i+1])):
                     i += 1
                     val = val + " " + lines[i].strip().rstrip('"')
                 current_attrs[key.strip()] = val.strip()
-        
         i += 1
-    
-    # Son feature'ı da kaydet
-    if current_feature and current_attrs.get("product"):
-        product = current_attrs.get("product", "")
-        if query_lc in product.lower():
-            loc = current_location
-            strand = "-" if "complement" in loc else "+"
-            coords = re.findall(r'\d+', loc)
-            start = coords[0] if coords else ""
-            stop = coords[-1] if len(coords) > 1 else ""
-            matches.append({
-                "locus_tag": current_attrs.get("locus_tag", ""),
-                "contig": current_contig,
-                "start": start,
-                "stop": stop,
-                "strand": strand,
-                "type": current_feature,
-                "gene": current_attrs.get("gene", ""),
-                "product": product,
-            })
-    
+    save()
     return matches
 
-# ─── NCBI GFF fallback ────────────────────────────────────────────────────────
+def parse_gff(content, product_queries):
+    queries_lc = [q.lower().strip() for q in product_queries]
+    matches = []
+    for line in content.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 9:
+            continue
+        contig, _, feat_type, start, stop, _, strand, _, attrs = parts[:9]
+        attr_dict = {}
+        for attr in attrs.split(";"):
+            if "=" in attr:
+                k, v = attr.split("=", 1)
+                attr_dict[k.strip()] = urllib.parse.unquote(v.strip())
+        product = attr_dict.get("product", "")
+        mq = [q for q in queries_lc if q in product.lower()]
+        if not mq:
+            continue
+        matches.append({
+            "locus_tag":     attr_dict.get("locus_tag", ""),
+            "contig":        contig,
+            "start":         start,
+            "stop":          stop,
+            "strand":        strand,
+            "type":          feat_type,
+            "gene":          attr_dict.get("gene", ""),
+            "product":       product,
+            "protein_id":    attr_dict.get("protein_id", ""),
+            "matched_query": mq[0],
+        })
+    return matches
+
+def parse_content(content, product_queries):
+    if "LOCUS" in content[:500] and "FEATURES" in content:
+        return parse_gbff(content, product_queries)
+    return parse_gff(content, product_queries)
+
+# ─── ASYNC ANNOTATION DOWNLOAD ───────────────────────────────────────────────
+
+async def fetch_url_async(session, url, timeout=40):
+    try:
+        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+            if r.status == 200:
+                raw = await r.read()
+                if url.endswith(".gz"):
+                    return gzip.decompress(raw).decode("utf-8", errors="replace")
+                return raw.decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return None
+
+async def find_ncbi_gff_url_async(session, accession):
+    acc_base = accession.split(".")[0]
+    # NCBI eSearch
+    try:
+        async with session.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+            params={"db": "assembly", "term": acc_base, "retmode": "json"},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            data = await r.json(content_type=None)
+            ids = data.get("esearchresult", {}).get("idlist", [])
+            if ids:
+                async with session.get(
+                    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+                    params={"db": "assembly", "id": ids[0], "retmode": "json"},
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as r2:
+                    data2 = await r2.json(content_type=None)
+                    doc = data2.get("result", {}).get(ids[0], {})
+                    ftp = doc.get("ftppath_refseq") or doc.get("ftppath_genbank")
+                    if ftp:
+                        ftp = ftp.replace("ftp://", "https://")
+                        async with session.get(ftp + "/", timeout=aiohttp.ClientTimeout(total=15)) as r3:
+                            text = await r3.text()
+                            files = re.findall(r'href="([^"]+genomic\.gff\.gz)"', text)
+                            if files:
+                                fname = files[0]
+                                return fname if fname.startswith("http") else ftp + "/" + fname
+    except Exception:
+        pass
+
+    # FTP doğrudan dene
+    digits = re.sub(r"\D", "", acc_base)
+    if len(digits) >= 9:
+        d1, d2, d3 = digits[:3], digits[3:6], digits[6:9]
+        for prefix in ["GCF", "GCA"]:
+            ftp_base = f"https://ftp.ncbi.nlm.nih.gov/genomes/all/{prefix}/{d1}/{d2}/{d3}/"
+            try:
+                async with session.get(ftp_base, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status != 200:
+                        continue
+                    text = await r.text()
+                    folders = re.findall(r'href="([^"\']+/)"', text)
+                    for folder in folders:
+                        folder = folder.strip("/")
+                        if acc_base in folder:
+                            folder_url = ftp_base + folder + "/"
+                            async with session.get(folder_url, timeout=aiohttp.ClientTimeout(total=15)) as r2:
+                                text2 = await r2.text()
+                                files = re.findall(r'href="([^"\']+genomic\.gff\.gz)"', text2)
+                                if files:
+                                    fname = files[0]
+                                    return fname if fname.startswith("http") else folder_url + fname
+            except Exception:
+                continue
+    return None
+
+async def download_annotation_async(session, accession):
+    """Cache → DSMZ CDN GBFF → NCBI GFF sırasıyla dene."""
+    cached = cache_get(accession)
+    if cached:
+        print(f"[CACHE] {accession}")
+        return cached[0], cached[1]
+
+    acc_base = accession.split(".")[0]
+
+    # 1. DSMZ CDN Bakta GBFF
+    for url in [f"{CDN_BASE}/{acc_base}.gbff", f"{CDN_BASE}/{accession}.gbff",
+                f"{CDN_BASE}/{acc_base}.gbff.gz", f"{CDN_BASE}/{accession}.gbff.gz"]:
+        content = await fetch_url_async(session, url, timeout=40)
+        if content:
+            cache_set(accession, (content, "BacDive Bakta annotation"))
+            print(f"[GBFF] {accession}")
+            return content, "BacDive Bakta annotation"
+
+    # 2. NCBI GFF
+    gff_url = await find_ncbi_gff_url_async(session, accession)
+    if gff_url:
+        content = await fetch_url_async(session, gff_url, timeout=60)
+        if content:
+            cache_set(accession, (content, "NCBI GFF annotation"))
+            print(f"[GFF] {accession}")
+            return content, "NCBI GFF annotation"
+
+    return None, None
+
+# ─── SYNC WRAPPERS (Mod 1) ───────────────────────────────────────────────────
+
+def fetch_gbff_features(accession, product_query):
+    acc_base = accession.split(".")[0]
+    for url in [f"{CDN_BASE}/{acc_base}.gbff", f"{CDN_BASE}/{accession}.gbff",
+                f"{CDN_BASE}/{acc_base}.gbff.gz", f"{CDN_BASE}/{accession}.gbff.gz"]:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=40)
+            if r.ok:
+                raw = r.content
+                content = gzip.decompress(raw).decode("utf-8", errors="replace") \
+                          if url.endswith(".gz") else raw.decode("utf-8", errors="replace")
+                return parse_gbff(content, [product_query]), None
+        except Exception:
+            continue
+    return None, "GBFF indirilemedi"
 
 def find_ncbi_gff(accession):
     acc_base = accession.split(".")[0]
@@ -281,36 +356,13 @@ def find_ncbi_gff(accession):
     return None
 
 def search_ncbi_gff(gff_url, product_query):
-    r = requests.get(gff_url, headers=HEADERS, timeout=180)
+    r = requests.get(gff_url, headers=HEADERS, timeout=60)
     raw = r.content
     content = gzip.decompress(raw).decode("utf-8", errors="replace") \
-        if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
-    query_lc = product_query.lower()
-    matches = []
-    for line in content.splitlines():
-        if line.startswith("#") or not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) < 9:
-            continue
-        contig, _, feat_type, start, stop, _, strand, _, attrs = parts[:9]
-        attr_dict = {}
-        for attr in attrs.split(";"):
-            if "=" in attr:
-                k, v = attr.split("=", 1)
-                attr_dict[k.strip()] = urllib.parse.unquote(v.strip())
-        product = attr_dict.get("product", "")
-        if query_lc not in product.lower():
-            continue
-        matches.append({
-            "locus_tag": attr_dict.get("locus_tag", ""),
-            "contig": contig, "start": start, "stop": stop,
-            "strand": strand, "type": feat_type,
-            "gene": attr_dict.get("gene", ""), "product": product,
-        })
-    return matches
+              if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
+    return parse_gff(content, [product_query])
 
-# ─── Endpoints ────────────────────────────────────────────────────────────────
+# ─── ENDPOINTS ────────────────────────────────────────────────────────────────
 
 @app.route("/check-organism", methods=["POST"])
 def check_organism():
@@ -324,37 +376,29 @@ def check_organism():
         return jsonify({"error": f"BacDive hatasi: {str(e)}"}), 502
     if not hits:
         return jsonify({"found": False, "message": "BacDive'da kayit bulunamadi."})
-    
-    # Tüm strainleri listele
     strains = []
     for h in hits:
         accession = find_accession(h["raw"])
         strains.append({
-            "bacdive_id": h["id"],
-            "bacdive_url": f"{BACDIVE_WEB}/{h['id']}",
-            "strain_name": h["name"],
-            "accession": accession,
+            "bacdive_id":   h["id"],
+            "bacdive_url":  f"{BACDIVE_WEB}/{h['id']}",
+            "strain_name":  h["name"],
+            "accession":    accession,
             "has_assembly": bool(accession),
-            "_strain": h["raw"],
+            "_strain":      h["raw"],
         })
-    
     return jsonify({
-        "found": True,
-        "total_hits": len(strains),
-        "strains": strains,
-        # Geriye uyumluluk için ilk strain bilgilerini de ver
-        "bacdive_id": strains[0]["bacdive_id"],
-        "bacdive_url": strains[0]["bacdive_url"],
-        "strain_name": strains[0]["strain_name"],
-        "_strain": strains[0]["_strain"],
+        "found": True, "total_hits": len(strains), "strains": strains,
+        "bacdive_id": strains[0]["bacdive_id"], "bacdive_url": strains[0]["bacdive_url"],
+        "strain_name": strains[0]["strain_name"], "_strain": strains[0]["_strain"],
     })
 
 
 @app.route("/search-product", methods=["POST"])
 def search_product():
-    data = request.get_json()
-    bid = (data or {}).get("bacdive_id")
-    product_q = (data or {}).get("product", "").strip()
+    data       = request.get_json()
+    bid        = (data or {}).get("bacdive_id")
+    product_q  = (data or {}).get("product", "").strip()
     strain_raw = (data or {}).get("_strain")
 
     if not bid or not product_q:
@@ -369,9 +413,7 @@ def search_product():
                 accession = find_accession(r.json())
         except Exception:
             pass
-
     if not accession:
-        # BacDive'da accession yoksa NCBI'dan organizma adıyla ara
         strain_name = ""
         if strain_raw:
             for section in strain_raw.values():
@@ -382,204 +424,221 @@ def search_product():
                             break
                 if strain_name:
                     break
-        
         if strain_name:
-            print(f"[INFO] BacDive'da accession yok, NCBI taxonomy araması: {strain_name}")
             accession = find_accession_via_ncbi(strain_name)
-    
     if not accession:
-        return jsonify({
-            "found": False, "error_code": "NO_ASSEMBLY",
-            "message": "Bu BacDive kaydinda genome assembly accession bulunamadi ve NCBI'da da bulunamadi.",
-        })
+        return jsonify({"found": False, "error_code": "NO_ASSEMBLY",
+                        "message": "Genome assembly bulunamadi."})
 
-    # 1. DSMZ CDN'den GBFF indir (BacDive'ın kendi Bakta annotation'ı)
-    print(f"[INFO] DSMZ CDN GBFF deneniyor: {accession}, product: {product_q}")
-    matches, err = fetch_gbff_features(accession, product_q)
-
-    if matches is not None:
-        if not matches:
-            return jsonify({
-                "found": False, "error_code": "NO_PRODUCT",
-                "message": f"'{product_q}' BacDive Bakta feature table'da bulunamadi.",
-                "accession": accession, "source": "BacDive Bakta (DSMZ CDN)"
-            })
-        return jsonify({
-            "found": True, "accession": accession, "bacdive_id": bid,
-            "product_query": product_q, "total": len(matches),
-            "source": "BacDive Bakta annotation",
-            "results": matches,
-        })
-
-    # 2. NCBI GFF fallback
-    print(f"[INFO] GBFF basarisiz ({err}), NCBI GFF deneniyor...")
-    gff_url = find_ncbi_gff(accession)
-    if not gff_url:
-        return jsonify({
-            "found": False, "error_code": "NO_GFF_URL",
-            "message": f"Ne DSMZ CDN ne de NCBI GFF erisilebilir. Accession: {accession}",
-            "accession": accession,
-            "bacdive_url": f"{BACDIVE_WEB}/{bid}",
-        })
-
-    try:
-        matches = search_ncbi_gff(gff_url, product_q)
-    except Exception as e:
-        return jsonify({
-            "found": False, "error_code": "DOWNLOAD_ERROR",
-            "message": f"Annotation indirilemedi: {str(e)}",
-            "accession": accession,
-        })
+    product_queries = [p.strip() for p in product_q.split(",") if p.strip()]
+    matches, err = fetch_gbff_features(accession, product_queries[0] if len(product_queries)==1 else product_q)
+    if matches is None:
+        gff_url = find_ncbi_gff(accession)
+        if not gff_url:
+            return jsonify({"found": False, "error_code": "NO_GFF_URL",
+                            "message": f"Annotation indirilemedi. Accession: {accession}",
+                            "accession": accession})
+        try:
+            matches = search_ncbi_gff(gff_url, product_q)
+        except Exception as e:
+            return jsonify({"found": False, "error_code": "DOWNLOAD_ERROR",
+                            "message": str(e), "accession": accession})
 
     if not matches:
-        return jsonify({
-            "found": False, "error_code": "NO_PRODUCT",
-            "message": f"'{product_q}' NCBI feature table'da bulunamadi.",
-            "accession": accession,
-        })
-
-    return jsonify({
-        "found": True, "accession": accession, "bacdive_id": bid,
-        "product_query": product_q, "total": len(matches),
-        "source": "NCBI GFF annotation",
-        "results": matches,
-    })
+        return jsonify({"found": False, "error_code": "NO_PRODUCT",
+                        "message": f"'{product_q}' bulunamadi.", "accession": accession})
+    return jsonify({"found": True, "accession": accession, "bacdive_id": bid,
+                    "product_query": product_q, "total": len(matches),
+                    "source": "annotation", "results": matches})
 
 
-# ─── MOD 2: Cins tarama (SSE) ────────────────────────────────────────────────
+@app.route("/protein-sequence", methods=["POST"])
+def protein_sequence():
+    data       = request.get_json()
+    protein_id = (data or {}).get("protein_id", "").strip()
+    if not protein_id:
+        return jsonify({"error": "protein_id gerekli"}), 400
+    try:
+        r = requests.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+            params={"db": "protein", "id": protein_id, "rettype": "fasta", "retmode": "text"},
+            timeout=15)
+        if r.ok and r.text.startswith(">"):
+            return jsonify({"found": True, "protein_id": protein_id, "sequence": r.text.strip()})
+    except Exception as e:
+        return jsonify({"found": False, "message": str(e)})
+    return jsonify({"found": False, "message": "Sekans bulunamadi."})
+
+
+# ─── MOD 2: Paralel async tarama (SSE) ───────────────────────────────────────
 
 def sse_event(data):
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
+
+async def scan_all_async(organisms, product_queries, queue):
+    """
+    Tüm strainleri async olarak tara.
+    Sonuçları queue'ya koy — Flask SSE generator oradan okur.
+    """
+    connector = aiohttp.TCPConnector(limit=10)
+    async with aiohttp.ClientSession(connector=connector) as session:
+
+        for org in organisms:
+            await queue.put(sse_event({"type": "status",
+                                       "message": f"'{org}' BacDive'da aranıyor..."}))
+            try:
+                hits = search_organism(org)  # sync, BacDive client thread-safe değil
+            except Exception as e:
+                await queue.put(sse_event({"type": "error",
+                                           "message": f"BacDive hatası ({org}): {e}"}))
+                continue
+
+            if not hits:
+                await queue.put(sse_event({"type": "error",
+                                           "message": f"'{org}' için kayıt bulunamadı."}))
+                continue
+
+            with_asm, no_asm = [], []
+            for h in hits:
+                acc = find_accession(h["raw"])
+                if acc:
+                    with_asm.append((h, acc))
+                else:
+                    no_asm.append(h)
+
+            await queue.put(sse_event({
+                "type": "summary", "organism": org,
+                "total_strains": len(hits),
+                "with_assembly": len(with_asm),
+                "no_assembly":   len(no_asm),
+            }))
+
+            for h in no_asm:
+                await queue.put(sse_event({
+                    "type": "skip", "organism": org,
+                    "strain_name": h["name"], "bacdive_id": h["id"],
+                    "reason": "Assembly yok",
+                }))
+
+            total = len(with_asm)
+            found_count = 0
+
+            # Tüm strainleri aynı anda async indir, sonuç geldikçe SSE'ye yaz
+            async def scan_one(h, accession, idx):
+                nonlocal found_count
+                strain_name = h["name"]
+                bid         = h["id"]
+
+                await queue.put(sse_event({
+                    "type":        "scanning",
+                    "organism":    org,
+                    "strain_name": strain_name,
+                    "accession":   accession,
+                    "bacdive_id":  bid,
+                    "progress":    idx + 1,
+                    "total":       total,
+                }))
+
+                content, source = await download_annotation_async(session, accession)
+
+                if content is None:
+                    await queue.put(sse_event({
+                        "type": "skip", "organism": org,
+                        "strain_name": strain_name, "accession": accession,
+                        "bacdive_id": bid, "reason": "Annotation indirilemedi",
+                    }))
+                    return
+
+                matches = parse_content(content, product_queries)
+
+                if not matches:
+                    await queue.put(sse_event({
+                        "type": "not_found", "organism": org,
+                        "strain_name": strain_name, "accession": accession,
+                        "bacdive_id": bid,
+                    }))
+                    return
+
+                found_count += 1
+                await queue.put(sse_event({
+                    "type":        "found",
+                    "organism":    org,
+                    "strain_name": strain_name,
+                    "accession":   accession,
+                    "bacdive_id":  bid,
+                    "bacdive_url": f"{BACDIVE_WEB}/{bid}",
+                    "source":      source,
+                    "match_count": len(matches),
+                    "results":     matches,
+                }))
+
+            # Hepsini aynı anda başlat
+            tasks = [scan_one(h, acc, idx) for idx, (h, acc) in enumerate(with_asm)]
+            await asyncio.gather(*tasks)
+
+            await queue.put(sse_event({
+                "type":          "done",
+                "organism":      org,
+                "total_scanned": total,
+                "found_count":   found_count,
+                "message":       f"'{org}' tamamlandı: {total} strain, {found_count} pozitif.",
+            }))
+
+    await queue.put(None)  # sentinel — bitti
+
+
 @app.route("/scan-organism", methods=["GET"])
 def scan_organism():
-    organism = request.args.get("organism", "").strip()
-    product_q = request.args.get("product", "").strip()
-    if not organism or not product_q:
+    organism_raw = request.args.get("organism", "").strip()
+    product_raw  = request.args.get("product", "").strip()
+    if not organism_raw or not product_raw:
         return jsonify({"error": "organism ve product gerekli"}), 400
 
+    organisms       = [o.strip() for o in organism_raw.split(",") if o.strip()]
+    product_queries = [p.strip() for p in product_raw.split(",") if p.strip()]
+
     def generate():
-        yield sse_event({"type": "status", "message": f"BacDive'da '{organism}' aranıyor..."})
+        # asyncio event loop'u ayrı thread'de çalıştır
+        q = None
+        loop = asyncio.new_event_loop()
 
-        try:
-            hits = search_organism(organism)
-        except Exception as e:
-            yield sse_event({"type": "error", "message": f"BacDive hatası: {str(e)}"})
-            return
+        import queue as stdlib_queue
+        q = stdlib_queue.Queue()
 
-        if not hits:
-            yield sse_event({"type": "error", "message": f"'{organism}' için kayıt bulunamadı."})
-            return
+        async def run():
+            aqueue = asyncio.Queue()
+            # async queue → sync queue köprüsü
+            async def bridge():
+                while True:
+                    item = await aqueue.get()
+                    q.put(item)
+                    if item is None:
+                        break
+            await asyncio.gather(
+                scan_all_async(organisms, product_queries, aqueue),
+                bridge()
+            )
 
-        with_assembly = []
-        no_assembly = []
-        for h in hits:
-            acc = find_accession(h["raw"])
-            if acc:
-                with_assembly.append((h, acc))
-            else:
-                no_assembly.append(h)
+        def run_loop():
+            loop.run_until_complete(run())
 
-        total = len(with_assembly)
+        t = threading.Thread(target=run_loop, daemon=True)
+        t.start()
 
-        yield sse_event({
-            "type": "summary",
-            "total_strains": len(hits),
-            "with_assembly": total,
-            "no_assembly": len(no_assembly),
-        })
-
-        # Assembly olmayanları hemen skip olarak gönder
-        for h in no_assembly:
-            yield sse_event({
-                "type": "skip",
-                "strain_name": h["name"],
-                "bacdive_id": h["id"],
-                "reason": "Assembly yok",
-            })
-
-        # Assembly olanları teker teker tara
-        found_count = 0
-        for idx, (h, accession) in enumerate(with_assembly):
-            strain_name = h["name"]
-            bid = h["id"]
-
-            yield sse_event({
-                "type": "scanning",
-                "strain_name": strain_name,
-                "accession": accession,
-                "bacdive_id": bid,
-                "progress": idx + 1,
-                "total": total,
-            })
-
-            matches = None
-            source = None
-
-            # 1. DSMZ CDN Bakta GBFF
-            try:
-                m, err = fetch_gbff_features(accession, product_q)
-                if m is not None:
-                    matches = m
-                    source = "BacDive Bakta annotation"
-            except Exception:
-                pass
-
-            # 2. NCBI GFF fallback
-            if matches is None:
-                try:
-                    gff_url = find_ncbi_gff(accession)
-                    if gff_url:
-                        matches = search_ncbi_gff(gff_url, product_q)
-                        source = "NCBI GFF annotation"
-                except Exception:
-                    pass
-
-            if matches is None:
-                yield sse_event({
-                    "type": "skip",
-                    "strain_name": strain_name,
-                    "accession": accession,
-                    "bacdive_id": bid,
-                    "reason": "Annotation indirilemedi",
-                })
-                continue
-
-            if len(matches) == 0:
-                yield sse_event({
-                    "type": "not_found",
-                    "strain_name": strain_name,
-                    "accession": accession,
-                    "bacdive_id": bid,
-                })
-                continue
-
-            found_count += 1
-            yield sse_event({
-                "type": "found",
-                "strain_name": strain_name,
-                "accession": accession,
-                "bacdive_id": bid,
-                "bacdive_url": f"{BACDIVE_WEB}/{bid}",
-                "source": source,
-                "match_count": len(matches),
-                "results": matches,
-            })
-
-        yield sse_event({
-            "type": "done",
-            "total_scanned": total,
-            "found_count": found_count,
-            "message": f"Tamamlandı: {total} strain, {found_count} pozitif.",
-        })
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            yield item
 
     return Response(
         stream_with_context(generate()),
         mimetype="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Access-Control-Allow-Origin": "*",
+            "Cache-Control":             "no-cache",
+            "X-Accel-Buffering":         "no",
+            "Access-Control-Allow-Origin":"*",
         }
     )
 
@@ -587,5 +646,5 @@ def scan_organism():
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 5050))
-    print(f"BacDive backend http://localhost:{port} adresinde calisiyor...")
+    print(f"DeepDive async backend http://localhost:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
