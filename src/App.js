@@ -566,7 +566,7 @@ function ScanMode2({ t, addHistory }) {
       )}
 
       {/* Summary */}
-      {summary && Object.values(summary).map(s => (
+      {summary && Object.entries(summary).map(([key, s]) => (
         <div key={s.organism} style={{marginTop:10, padding:"8px 12px", border:`1px solid ${t.border}`,
           borderRadius:3, background:t.bg, fontFamily:"IBM Plex Mono,monospace", fontSize:11, color:t.textMuted}}>
           <b style={{color:t.accent}}>{s.organism}</b>: {s.total_strains} strain —{" "}

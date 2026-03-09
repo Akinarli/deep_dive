@@ -153,7 +153,7 @@ def _download_annotation(accession: str):
     for url in [f"{CDN_BASE}/{acc_base}.gbff", f"{CDN_BASE}/{accession}.gbff",
                 f"{CDN_BASE}/{acc_base}.gbff.gz", f"{CDN_BASE}/{accession}.gbff.gz"]:
         try:
-            r = requests.get(url, headers=HEADERS, timeout=60)
+            r = requests.get(url, headers=HEADERS, timeout=45)
             if r.ok:
                 raw = r.content
                 content = gzip.decompress(raw).decode("utf-8", errors="replace") \
@@ -169,7 +169,7 @@ def _download_annotation(accession: str):
     gff_url = _find_ncbi_gff_url(accession)
     if gff_url:
         try:
-            r = requests.get(gff_url, headers=HEADERS, timeout=180)
+            r = requests.get(gff_url, headers=HEADERS, timeout=120)
             raw = r.content
             content = gzip.decompress(raw).decode("utf-8", errors="replace") \
                       if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
@@ -458,33 +458,39 @@ def scan_organism():
 
         total = len(all_pairs)
         yield sse_event({"type": "scan_start", "total": total,
-                         "message": f"Toplam {total} strain paralel taranıyor..."})
+                         "message": f"Toplam {total} strain sırayla taranıyor..."})
         if total == 0:
             yield sse_event({"type": "done", "total_scanned": 0, "found_count": 0,
                              "message": "Taranacak assembly bulunamadı."})
             return
 
         found_count = 0
-        scanned     = 0
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            future_map = {
-                executor.submit(_scan_single, h, acc, product_queries, org): (h, acc, org)
-                for h, acc, org in all_pairs
-            }
-            for future in as_completed(future_map):
-                scanned += 1
-                try:
-                    result = future.result()
-                except Exception as e:
-                    h, acc, org = future_map[future]
-                    result = {"status": "skip", "strain_name": h["name"],
-                              "accession": acc, "bacdive_id": h["id"],
-                              "reason": str(e), "organism": org}
-                result["progress"] = scanned
-                result["total"]    = total
-                if result["status"] == "found":
-                    found_count += 1
-                yield sse_event(result)
+
+        # Sırayla tara — her strain bittikten sonra hemen SSE'ye gönder
+        for idx, (h, acc, org) in enumerate(all_pairs):
+            strain_name = h["name"]
+            bid         = h["id"]
+
+            # Taranıyor sinyali
+            yield sse_event({
+                "type":        "scanning",
+                "strain_name": strain_name,
+                "accession":   acc,
+                "bacdive_id":  bid,
+                "organism":    org,
+                "progress":    idx + 1,
+                "total":       total,
+            })
+
+            # Annotation indir ve tara
+            result = _scan_single(h, acc, product_queries, org)
+            result["progress"] = idx + 1
+            result["total"]    = total
+
+            if result["status"] == "found":
+                found_count += 1
+
+            yield sse_event(result)
 
         yield sse_event({"type": "done", "total_scanned": total, "found_count": found_count,
                          "message": f"Tamamlandı: {total} strain, {found_count} pozitif."})
