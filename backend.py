@@ -431,25 +431,50 @@ def search_product():
                         "message": "Genome assembly bulunamadi."})
 
     product_queries = [p.strip() for p in product_q.split(",") if p.strip()]
-    matches, err = fetch_gbff_features(accession, product_queries[0] if len(product_queries)==1 else product_q)
-    if matches is None:
+
+    # Annotation'ı indir (cache'den veya CDN/NCBI'dan)
+    content = None
+    source  = None
+
+    acc_base = accession.split(".")[0]
+    for url in [f"{CDN_BASE}/{acc_base}.gbff", f"{CDN_BASE}/{accession}.gbff",
+                f"{CDN_BASE}/{acc_base}.gbff.gz", f"{CDN_BASE}/{accession}.gbff.gz"]:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=40)
+            if r.ok:
+                raw = r.content
+                content = gzip.decompress(raw).decode("utf-8", errors="replace") \
+                          if url.endswith(".gz") else raw.decode("utf-8", errors="replace")
+                source = "BacDive Bakta annotation"
+                break
+        except Exception:
+            continue
+
+    if content is None:
         gff_url = find_ncbi_gff(accession)
         if not gff_url:
             return jsonify({"found": False, "error_code": "NO_GFF_URL",
                             "message": f"Annotation indirilemedi. Accession: {accession}",
                             "accession": accession})
         try:
-            matches = search_ncbi_gff(gff_url, product_q)
+            r = requests.get(gff_url, headers=HEADERS, timeout=60)
+            raw = r.content
+            content = gzip.decompress(raw).decode("utf-8", errors="replace") \
+                      if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
+            source = "NCBI GFF annotation"
         except Exception as e:
             return jsonify({"found": False, "error_code": "DOWNLOAD_ERROR",
                             "message": str(e), "accession": accession})
+
+    # Multi-keyword parse
+    matches = parse_content(content, product_queries)
 
     if not matches:
         return jsonify({"found": False, "error_code": "NO_PRODUCT",
                         "message": f"'{product_q}' bulunamadi.", "accession": accession})
     return jsonify({"found": True, "accession": accession, "bacdive_id": bid,
                     "product_query": product_q, "total": len(matches),
-                    "source": "annotation", "results": matches})
+                    "source": source, "results": matches})
 
 
 @app.route("/protein-sequence", methods=["POST"])
