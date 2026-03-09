@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 const API_BASE = "https://deepdive-backend-6nza.onrender.com";
@@ -382,6 +382,70 @@ const STYLE = `
     color: #3a5040; cursor: pointer; transition: all 0.2s;
   }
   .example-chip:hover { border-color: #4ade80; color: #4ade80; }
+
+  /* ── MOD 2 styles ── */
+  .mode-toggle {
+    display: flex; gap: 0; margin-bottom: 36px;
+    border: 1px solid #1c2820; border-radius: 4px; overflow: hidden;
+  }
+  .mode-btn {
+    flex: 1; padding: 12px 20px; border: none; cursor: pointer;
+    font-family: 'IBM Plex Mono', monospace; font-size: 12px; letter-spacing: 0.5px;
+    transition: all 0.2s; background: transparent; color: #3a5040;
+  }
+  .mode-btn.active { background: rgba(74,222,128,0.1); color: #4ade80; }
+  .mode-btn:hover:not(.active) { color: #6a9070; }
+  .mode-divider { width: 1px; background: #1c2820; flex-shrink: 0; }
+
+  .scan-list { margin-top: 20px; display: flex; flex-direction: column; gap: 8px; }
+
+  .scan-item {
+    border-radius: 3px; padding: 12px 16px;
+    animation: fadeUp 0.3s ease both;
+    font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+  }
+  .scan-item-found { border: 1px solid rgba(74,222,128,0.3); background: rgba(74,222,128,0.04); }
+  .scan-item-scanning { border: 1px solid rgba(74,222,128,0.1); background: #090c0a; }
+  .scan-item-skip { border: 1px solid rgba(255,255,255,0.04); background: transparent; opacity: 0.4; }
+  .scan-item-notfound { border: 1px solid rgba(255,255,255,0.05); background: transparent; opacity: 0.35; }
+
+  .scan-item-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+  .scan-strain-name { color: #d4e0cc; font-weight: 500; font-style: italic; }
+  .scan-badge { font-size: 10px; padding: 2px 8px; border-radius: 2px; letter-spacing: 1px; }
+  .scan-badge-found { background: rgba(74,222,128,0.15); color: #4ade80; border: 1px solid rgba(74,222,128,0.3); }
+  .scan-badge-scanning { background: rgba(74,222,128,0.05); color: #3a5040; border: 1px solid #1c2820; }
+  .scan-badge-skip { color: #3a5040; border: 1px solid #1c2820; }
+  .scan-badge-notfound { color: #2a3a30; }
+
+  .scan-meta { display: flex; gap: 12px; margin-top: 6px; flex-wrap: wrap; }
+  .scan-meta span { color: #3a5040; }
+  .scan-meta span b { color: #4ade80; font-weight: 400; }
+  .scan-meta span.blue b { color: #60a5fa; }
+
+  .scan-table-wrap { margin-top: 10px; overflow-x: auto; }
+  .scan-toggle-btn {
+    margin-top: 8px; background: transparent; border: 1px solid rgba(74,222,128,0.2);
+    color: #4ade80; font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+    padding: 4px 12px; border-radius: 2px; cursor: pointer; letter-spacing: 0.5px;
+  }
+  .scan-toggle-btn:hover { background: rgba(74,222,128,0.07); }
+
+  .scan-summary {
+    padding: 12px 16px; border: 1px solid #1c2820; border-radius: 3px;
+    background: #090c0a; font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+    color: #5a7060; margin-bottom: 12px;
+  }
+  .scan-summary b { color: #4ade80; }
+
+  .scan-progress-bar { height: 2px; background: #1c2820; border-radius: 1px; margin-top: 16px; overflow: hidden; }
+  .scan-progress-fill { height: 100%; background: #4ade80; border-radius: 1px; transition: width 0.4s ease; }
+
+  .scan-done-banner {
+    padding: 14px 16px; border: 1px solid rgba(74,222,128,0.3);
+    border-radius: 3px; background: rgba(74,222,128,0.06);
+    font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #4ade80;
+    display: flex; align-items: center; gap: 10px; margin-top: 8px;
+  }
 `;
 
 // ─── SUBCOMPONENTS ──────────────────────────────────────────────────────────
@@ -481,8 +545,283 @@ function FeatureTable({ rows, bacdiveId }) {
   );
 }
 
+// ─── MOD 2 COMPONENT ────────────────────────────────────────────────────────
+function ScanMode2() {
+  const [orgInput, setOrgInput] = useState("");
+  const [productInput, setProductInput] = useState("");
+  const [scanning, setScanning] = useState(false);
+  const [items, setItems] = useState([]);   // her strain için bir item
+  const [summary, setSummary] = useState(null);
+  const [done, setDone] = useState(null);
+  const [progress, setProgress] = useState({ current: 0, total: 0 });
+  const [expandedIds, setExpandedIds] = useState(new Set());
+  const esRef = useRef(null);
+  const bottomRef = useRef(null);
+
+  function toggleExpand(id) {
+    setExpandedIds(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
+
+  function reset() {
+    if (esRef.current) { esRef.current.close(); esRef.current = null; }
+    setScanning(false);
+    setItems([]);
+    setSummary(null);
+    setDone(null);
+    setProgress({ current: 0, total: 0 });
+    setExpandedIds(new Set());
+  }
+
+  function startScan() {
+    if (!orgInput.trim() || !productInput.trim()) return;
+    reset();
+    setScanning(true);
+
+    const params = new URLSearchParams({
+      organism: orgInput.trim(),
+      product: productInput.trim(),
+    });
+    const url = `${API_BASE}/scan-organism?${params}`;
+    const es = new EventSource(url);
+    esRef.current = es;
+
+    es.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+
+      if (data.type === "summary") {
+        setSummary(data);
+        setProgress({ current: 0, total: data.with_assembly });
+      }
+      else if (data.type === "scanning") {
+        setProgress({ current: data.progress, total: data.total });
+        // Taranıyor göstergesi — geçici item ekle
+        setItems(prev => {
+          const filtered = prev.filter(i => i.id !== `scan_${data.bacdive_id}`);
+          return [...filtered, {
+            id: `scan_${data.bacdive_id}`,
+            status: "scanning",
+            strain_name: data.strain_name,
+            accession: data.accession,
+            bacdive_id: data.bacdive_id,
+          }];
+        });
+        setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+      }
+      else if (data.type === "found") {
+        setProgress(p => ({ ...p, current: data.progress || p.current }));
+        setItems(prev => prev.map(i =>
+          i.id === `scan_${data.bacdive_id}`
+            ? { ...i, status: "found", ...data }
+            : i
+        ));
+      }
+      else if (data.type === "not_found") {
+        setItems(prev => prev.map(i =>
+          i.id === `scan_${data.bacdive_id}`
+            ? { ...i, status: "notfound" }
+            : i
+        ));
+      }
+      else if (data.type === "skip") {
+        // Assembly yok veya indirilemedi
+        setItems(prev => {
+          const exists = prev.find(i => i.id === `scan_${data.bacdive_id}`);
+          if (exists) return prev.map(i => i.id === `scan_${data.bacdive_id}` ? { ...i, status: "skip", reason: data.reason } : i);
+          return [...prev, {
+            id: `scan_${data.bacdive_id}`,
+            status: "skip",
+            strain_name: data.strain_name,
+            accession: data.accession,
+            bacdive_id: data.bacdive_id,
+            reason: data.reason,
+          }];
+        });
+      }
+      else if (data.type === "done") {
+        setDone(data);
+        setScanning(false);
+        es.close();
+        esRef.current = null;
+      }
+      else if (data.type === "error") {
+        setDone({ error: true, message: data.message });
+        setScanning(false);
+        es.close();
+        esRef.current = null;
+      }
+    };
+
+    es.onerror = () => {
+      setScanning(false);
+      es.close();
+      esRef.current = null;
+    };
+  }
+
+  const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+
+  return (
+    <div className="card">
+      <div className="card-label">02 — Cins Taraması (Mod 2)</div>
+
+      <div className="input-row">
+        <div className="input-wrap">
+          <input
+            value={orgInput}
+            onChange={e => setOrgInput(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && !scanning && startScan()}
+            placeholder="Organizma cinsi… (ör: halomonas)"
+            disabled={scanning}
+          />
+        </div>
+        <div className="input-wrap">
+          <input
+            value={productInput}
+            onChange={e => setProductInput(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && !scanning && startScan()}
+            placeholder="Product keyword… (ör: levan)"
+            disabled={scanning}
+          />
+        </div>
+        <button
+          className="btn btn-primary"
+          onClick={scanning ? reset : startScan}
+          disabled={!orgInput.trim() || !productInput.trim()}
+          style={scanning ? { background: "#f87171", color: "#1a0000" } : {}}
+        >
+          {scanning ? <><IconX /> Durdur</> : <><IconSearch /> Tara</>}
+        </button>
+      </div>
+
+      {/* Progress bar */}
+      {(scanning || done) && progress.total > 0 && (
+        <div className="scan-progress-bar">
+          <div className="scan-progress-fill" style={{ width: `${pct}%` }} />
+        </div>
+      )}
+
+      {/* Summary */}
+      {summary && (
+        <div className="scan-summary" style={{ marginTop: 16 }}>
+          <b>{summary.total_strains}</b> strain bulundu —{" "}
+          <b>{summary.with_assembly}</b> assembly var,{" "}
+          <span style={{ color: "#f59e0b" }}><b>{summary.no_assembly}</b></span> assembly yok
+          {scanning && <span style={{ color: "#3a5040" }}> — taranıyor...</span>}
+        </div>
+      )}
+
+      {/* Scan items */}
+      {items.length > 0 && (
+        <div className="scan-list">
+          {items.map(item => (
+            <div key={item.id} className={`scan-item scan-item-${item.status}`}>
+              <div className="scan-item-header">
+                <span className="scan-strain-name">{item.strain_name}</span>
+                {item.status === "found" && (
+                  <span className="scan-badge scan-badge-found">✓ {item.match_count} GEN BULUNDU</span>
+                )}
+                {item.status === "scanning" && (
+                  <span className="scan-badge scan-badge-scanning">⏳ taranıyor</span>
+                )}
+                {item.status === "skip" && (
+                  <span className="scan-badge scan-badge-skip">— {item.reason || "atlandı"}</span>
+                )}
+                {item.status === "notfound" && (
+                  <span className="scan-badge scan-badge-notfound">∅ eşleşme yok</span>
+                )}
+              </div>
+
+              {(item.accession || item.bacdive_id) && (
+                <div className="scan-meta">
+                  {item.bacdive_id && <span>BacDive: <b>{item.bacdive_id}</b></span>}
+                  {item.accession && <span className="blue">Assembly: <b>{item.accession}</b></span>}
+                  {item.source && <span>Kaynak: <b style={{ color: "#93c5fd" }}>{item.source}</b></span>}
+                  {item.bacdive_url && (
+                    <span>
+                      <a href={item.bacdive_url} target="_blank" rel="noreferrer"
+                        style={{ color: "#4ade80", textDecoration: "none", borderBottom: "1px dashed rgba(74,222,128,0.4)" }}>
+                        BacDive ↗
+                      </a>
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Found: tablo */}
+              {item.status === "found" && item.results && (
+                <>
+                  <button className="scan-toggle-btn" onClick={() => toggleExpand(item.id)}>
+                    {expandedIds.has(item.id) ? "▲ Genleri gizle" : `▼ ${item.match_count} geni göster`}
+                  </button>
+                  {expandedIds.has(item.id) && (
+                    <div className="scan-table-wrap">
+                      <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 8 }}>
+                        <thead>
+                          <tr style={{ borderBottom: "1px solid #1c2820" }}>
+                            {["Locus Tag", "Contig", "Start", "Stop", "Strand", "Type", "Gene", "Product"].map(h => (
+                              <th key={h} style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "10px", letterSpacing: "1px", color: "#3a5040", fontWeight: 500, textTransform: "uppercase", padding: "8px 10px", textAlign: "left", whiteSpace: "nowrap" }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {item.results.map((r, i) => (
+                            <tr key={i} style={{ borderBottom: "1px solid #0e1510" }}>
+                              <td style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "11px", padding: "8px 10px", whiteSpace: "nowrap" }}>
+                                {r.locus_tag ? (
+                                  <a href={`https://www.ncbi.nlm.nih.gov/nuccore/${r.contig}?from=${r.start}&to=${r.stop}&strand=${r.strand === "-" ? "2" : "1"}`}
+                                    target="_blank" rel="noreferrer"
+                                    style={{ color: "#4ade80", textDecoration: "none", borderBottom: "1px dashed rgba(74,222,128,0.4)" }}>
+                                    {r.locus_tag}
+                                  </a>
+                                ) : "—"}
+                              </td>
+                              <td style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "11px", padding: "8px 10px", color: "#8ab09a", whiteSpace: "nowrap" }}>{r.contig}</td>
+                              <td style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "11px", padding: "8px 10px", color: "#8ab09a" }}>{Number(r.start).toLocaleString()}</td>
+                              <td style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "11px", padding: "8px 10px", color: "#8ab09a" }}>{Number(r.stop).toLocaleString()}</td>
+                              <td style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "11px", padding: "8px 10px", color: r.strand === "+" ? "#4ade80" : "#f472b6" }}>{r.strand}</td>
+                              <td style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "10px", padding: "8px 10px", fontWeight: 600, letterSpacing: "1px", color: r.type === "CDS" ? "#60a5fa" : r.type === "rRNA" ? "#c084fc" : "#f472b6" }}>{r.type}</td>
+                              <td style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "11px", padding: "8px 10px", color: "#93c5fd" }}>{r.gene || "—"}</td>
+                              <td style={{ fontFamily: "IBM Plex Mono, monospace", fontSize: "11px", padding: "8px 10px", color: "#d4e0cc", maxWidth: 220 }}>{r.product}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Done banner */}
+      {done && !done.error && (
+        <div className="scan-done-banner">
+          <IconCheck />
+          <span>
+            Tarama tamamlandı — <b>{done.total_scanned}</b> strain tarandı,{" "}
+            <b style={{ color: "#86efac" }}>{done.found_count}</b> tanesinde{" "}
+            "<b>{productInput}</b>" bulundu.
+          </span>
+        </div>
+      )}
+      {done?.error && (
+        <StatusMsg type="error">{done.message}</StatusMsg>
+      )}
+
+      <div ref={bottomRef} />
+    </div>
+  );
+}
+
 // ─── MAIN APP ───────────────────────────────────────────────────────────────
 export default function App() {
+  const [mode, setMode] = useState(1); // 1 = orijinal, 2 = cins taraması
   const [step, setStep] = useState(1);
   const [orgInput, setOrgInput] = useState("");
   const [orgLoading, setOrgLoading] = useState(false);
@@ -559,6 +898,23 @@ export default function App() {
           </div>
 
           <StepIndicator step={step} />
+
+          {/* ── MOD SEÇİCİ ── */}
+          <div className="mode-toggle">
+            <button className={`mode-btn ${mode === 1 ? "active" : ""}`} onClick={() => setMode(1)}>
+              MOD 1 — Strain Sorgula
+            </button>
+            <div className="mode-divider" />
+            <button className={`mode-btn ${mode === 2 ? "active" : ""}`} onClick={() => setMode(2)}>
+              MOD 2 — Cins Tara
+            </button>
+          </div>
+
+          {/* ── MOD 2 ── */}
+          {mode === 2 && <ScanMode2 />}
+
+          {/* ── MOD 1 ── */}
+          {mode === 1 && <>
 
           {/* ── STEP 1: Organism ── */}
           <div className="card">
@@ -774,6 +1130,10 @@ export default function App() {
           <div style={{textAlign:"center", marginTop:40, fontFamily:"'IBM Plex Mono', monospace", fontSize:"11px", color:"#1e2e24", letterSpacing:"0.5px"}}>
             BacDive API v2 · NCBI Datasets · Feature Table via GFF3 annotation
           </div>
+
+          {/* ── MOD 1 kapanış ── */}
+          </>}
+
         </div>
       </div>
     </>

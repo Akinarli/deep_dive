@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import bacdive
 import re
@@ -6,6 +6,7 @@ import json
 import gzip
 import requests
 import urllib.parse
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -444,6 +445,160 @@ def search_product():
         "source": "NCBI GFF annotation",
         "results": matches,
     })
+
+
+# ─── MOD 2: Organizma cinsi tarama (SSE) ─────────────────────────────────────
+
+def sse_event(data: dict) -> str:
+    """SSE formatında JSON event döndür."""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+@app.route("/scan-organism", methods=["GET"])
+def scan_organism():
+    """
+    Mod 2: Bir organizma cinsinin tüm strainlerini tara, product keyword'ü ara.
+    SSE (Server-Sent Events) ile her strain tarandıkça sonuç stream edilir.
+    
+    Query params:
+        organism: str  — örn. "halomonas"
+        product:  str  — örn. "levan"
+    """
+    organism = request.args.get("organism", "").strip()
+    product_q = request.args.get("product", "").strip()
+
+    if not organism or not product_q:
+        return jsonify({"error": "organism ve product gerekli"}), 400
+
+    def generate():
+        # 1. BacDive'dan tüm strainleri çek
+        yield sse_event({"type": "status", "message": f"BacDive'da '{organism}' aranıyor..."})
+
+        try:
+            hits = search_organism(organism)
+        except Exception as e:
+            yield sse_event({"type": "error", "message": f"BacDive hatası: {str(e)}"})
+            return
+
+        if not hits:
+            yield sse_event({"type": "error", "message": f"BacDive'da '{organism}' için kayıt bulunamadı."})
+            return
+
+        # Sadece assembly olanları tara, olmayanları bildir
+        with_assembly = []
+        no_assembly = []
+        for h in hits:
+            acc = find_accession(h["raw"])
+            if acc:
+                with_assembly.append((h, acc))
+            else:
+                no_assembly.append(h)
+
+        total = len(with_assembly)
+        skipped = len(no_assembly)
+
+        yield sse_event({
+            "type": "summary",
+            "total_strains": len(hits),
+            "with_assembly": total,
+            "no_assembly": skipped,
+            "message": f"{len(hits)} strain bulundu: {total} assembly var, {skipped} assembly yok — tarama başlıyor..."
+        })
+
+        # Assembly olmayanları hemen bildir
+        for h in no_assembly:
+            yield sse_event({
+                "type": "skip",
+                "strain_name": h["name"],
+                "bacdive_id": h["id"],
+                "reason": "Assembly yok"
+            })
+
+        # 2. Her strain için annotation tara
+        found_count = 0
+        for idx, (h, accession) in enumerate(with_assembly):
+            strain_name = h["name"]
+            bid = h["id"]
+
+            yield sse_event({
+                "type": "scanning",
+                "strain_name": strain_name,
+                "accession": accession,
+                "bacdive_id": bid,
+                "progress": idx + 1,
+                "total": total,
+            })
+
+            matches = None
+            source = None
+
+            # Önce DSMZ CDN Bakta GBFF dene
+            try:
+                m, err = fetch_gbff_features(accession, product_q)
+                if m is not None:
+                    matches = m
+                    source = "BacDive Bakta annotation"
+            except Exception:
+                pass
+
+            # Fallback: NCBI GFF
+            if matches is None:
+                try:
+                    gff_url = find_ncbi_gff(accession)
+                    if gff_url:
+                        matches = search_ncbi_gff(gff_url, product_q)
+                        source = "NCBI GFF annotation"
+                except Exception:
+                    pass
+
+            if matches is None:
+                yield sse_event({
+                    "type": "skip",
+                    "strain_name": strain_name,
+                    "accession": accession,
+                    "bacdive_id": bid,
+                    "reason": "Annotation indirilemedi"
+                })
+                continue
+
+            if len(matches) == 0:
+                yield sse_event({
+                    "type": "not_found",
+                    "strain_name": strain_name,
+                    "accession": accession,
+                    "bacdive_id": bid,
+                })
+                continue
+
+            # Eşleşme bulundu!
+            found_count += 1
+            yield sse_event({
+                "type": "found",
+                "strain_name": strain_name,
+                "accession": accession,
+                "bacdive_id": bid,
+                "bacdive_url": f"{BACDIVE_WEB}/{bid}",
+                "source": source,
+                "match_count": len(matches),
+                "results": matches,
+            })
+
+        # 3. Tarama bitti
+        yield sse_event({
+            "type": "done",
+            "total_scanned": total,
+            "found_count": found_count,
+            "message": f"Tarama tamamlandı: {total} strain tarandı, {found_count} tanesinde '{product_q}' bulundu."
+        })
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
 
 
 if __name__ == "__main__":
