@@ -494,11 +494,14 @@ function ScanMode2({ t, addHistory }) {
       else if (data.type === "scan_start") setProgress({ current:0, total: data.total });
       else if (data.type === "scanning") {
         setProgress(p => ({...p, current: data.progress}));
+        // Sadece aktif taranan item'ı göster — önceki "scanning" olanı kaldır, yenisini ekle
         setItems(prev => {
-          const filtered = prev.filter(i => i.id !== `s_${data.bacdive_id}`);
-          return [...filtered, { id:`s_${data.bacdive_id}`, status:"scanning",
-            strain_name:data.strain_name, accession:data.accession, bacdive_id:data.bacdive_id,
-            organism:data.organism }];
+          const withoutScanning = prev.filter(i => i.status !== "scanning");
+          return [...withoutScanning, {
+            id: `s_${data.bacdive_id}`, status: "scanning",
+            strain_name: data.strain_name, accession: data.accession,
+            bacdive_id: data.bacdive_id, organism: data.organism
+          }];
         });
         setTimeout(() => bottomRef.current?.scrollIntoView({behavior:"smooth"}), 50);
       }
