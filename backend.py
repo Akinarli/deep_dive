@@ -427,11 +427,13 @@ def scan_organism():
 
     def generate():
         yield sse_event({"type": "status",
-                         "message": f"{len(organisms)} organizma aranıyor, {len(product_queries)} keyword..."})
+                         "message": f"'{organism_raw}' BacDive'da aranıyor..."})
 
-        all_pairs = []
+        found_count  = 0
+        total_scanned = 0
+
         for org in organisms:
-            yield sse_event({"type": "status", "message": f"'{org}' BacDive'da aranıyor..."})
+            # BacDive'dan çek
             try:
                 hits = search_organism(org)
             except Exception as e:
@@ -441,61 +443,57 @@ def scan_organism():
                 yield sse_event({"type": "error", "message": f"'{org}' için kayıt bulunamadı."})
                 continue
 
-            with_asm, no_asm = [], []
+            # Assembly olanları ve olmayanları ayır
+            with_asm = []
             for h in hits:
                 acc = find_accession(h["raw"])
                 if acc:
                     with_asm.append((h, acc))
                 else:
-                    no_asm.append(h)
+                    # Assembly yok — hemen skip gönder
+                    yield sse_event({
+                        "type": "skip", "organism": org,
+                        "strain_name": h["name"], "bacdive_id": h["id"],
+                        "reason": "Assembly yok"
+                    })
 
             yield sse_event({
                 "type": "organism_summary", "organism": org,
-                "total_strains": len(hits), "with_assembly": len(with_asm), "no_assembly": len(no_asm),
-            })
-            for h in no_asm:
-                yield sse_event({"type": "skip", "organism": org,
-                                 "strain_name": h["name"], "bacdive_id": h["id"], "reason": "Assembly yok"})
-            all_pairs.extend([(h, acc, org) for h, acc in with_asm])
-
-        total = len(all_pairs)
-        yield sse_event({"type": "scan_start", "total": total,
-                         "message": f"Toplam {total} strain sırayla taranıyor..."})
-        if total == 0:
-            yield sse_event({"type": "done", "total_scanned": 0, "found_count": 0,
-                             "message": "Taranacak assembly bulunamadı."})
-            return
-
-        found_count = 0
-
-        # Sırayla tara — her strain bittikten sonra hemen SSE'ye gönder
-        for idx, (h, acc, org) in enumerate(all_pairs):
-            strain_name = h["name"]
-            bid         = h["id"]
-
-            # Taranıyor sinyali
-            yield sse_event({
-                "type":        "scanning",
-                "strain_name": strain_name,
-                "accession":   acc,
-                "bacdive_id":  bid,
-                "organism":    org,
-                "progress":    idx + 1,
-                "total":       total,
+                "total_strains": len(hits),
+                "with_assembly": len(with_asm),
+                "no_assembly":   len(hits) - len(with_asm),
             })
 
-            # Annotation indir ve tara
-            result = _scan_single(h, acc, product_queries, org)
-            result["progress"] = idx + 1
-            result["total"]    = total
+            # Her strain'i hemen tara — BacDive bekleme yok
+            for h, acc in with_asm:
+                total_scanned += 1
 
-            if result["status"] == "found":
-                found_count += 1
+                # Taranıyor sinyali — hemen gönder
+                yield sse_event({
+                    "type":        "scanning",
+                    "strain_name": h["name"],
+                    "accession":   acc,
+                    "bacdive_id":  h["id"],
+                    "organism":    org,
+                    "progress":    total_scanned,
+                })
 
-            yield sse_event(result)
+                # İndir + tara
+                result = _scan_single(h, acc, product_queries, org)
+                result["progress"] = total_scanned
 
-        yield sse_event({"type": "done", "total_scanned": total, "found_count": found_count,
-                         "message": f"Tamamlandı: {total} strain, {found_count} pozitif."})
+                if result["status"] == "found":
+                    found_count += 1
+
+                yield sse_event(result)
+
+        yield sse_event({
+            "type":          "done",
+            "total_scanned": total_scanned,
+            "found_count":   found_count,
+            "message":       f"Tamamlandı: {total_scanned} strain, {found_count} pozitif.",
+        })
+
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
