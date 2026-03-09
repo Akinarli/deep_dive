@@ -444,16 +444,18 @@ def scan_organism():
             with_asm, no_asm = [], []
             for h in hits:
                 acc = find_accession(h["raw"])
-                (with_asm if acc else no_asm).append((h, acc) if acc else h)
+                if acc:
+                    with_asm.append((h, acc))
+                else:
+                    no_asm.append(h)
 
             yield sse_event({
                 "type": "organism_summary", "organism": org,
                 "total_strains": len(hits), "with_assembly": len(with_asm), "no_assembly": len(no_asm),
             })
             for h in no_asm:
-                obj = h if isinstance(h, dict) else h[0]
                 yield sse_event({"type": "skip", "organism": org,
-                                 "strain_name": obj["name"], "bacdive_id": obj["id"], "reason": "Assembly yok"})
+                                 "strain_name": h["name"], "bacdive_id": h["id"], "reason": "Assembly yok"})
             all_pairs.extend([(h, acc, org) for h, acc in with_asm])
 
         total = len(all_pairs)
