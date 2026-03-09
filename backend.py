@@ -6,10 +6,9 @@ import json
 import gzip
 import requests
 import urllib.parse
-import asyncio
-import aiohttp
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 CORS(app)
@@ -26,7 +25,7 @@ HEADERS = {
 # ─── CACHE ───────────────────────────────────────────────────────────────────
 _cache = {}
 _cache_lock = threading.Lock()
-CACHE_TTL = 6 * 3600  # 6 saat
+CACHE_TTL = 6 * 3600
 
 def cache_get(key):
     with _cache_lock:
@@ -91,7 +90,7 @@ def find_accession_via_ncbi(organism_name):
         doc = esummary.json().get("result", {}).get(ids[0], {})
         return doc.get("assemblyaccession") or doc.get("synonym", {}).get("genbank")
     except Exception as e:
-        print(f"[WARN] NCBI taxonomy: {e}")
+        print(f"[WARN] NCBI: {e}")
         return None
 
 # ─── PARSERS ─────────────────────────────────────────────────────────────────
@@ -193,122 +192,7 @@ def parse_content(content, product_queries):
         return parse_gbff(content, product_queries)
     return parse_gff(content, product_queries)
 
-# ─── ASYNC ANNOTATION DOWNLOAD ───────────────────────────────────────────────
-
-async def fetch_url_async(session, url, timeout=40):
-    try:
-        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-            if r.status == 200:
-                raw = await r.read()
-                if url.endswith(".gz"):
-                    return gzip.decompress(raw).decode("utf-8", errors="replace")
-                return raw.decode("utf-8", errors="replace")
-    except Exception:
-        pass
-    return None
-
-async def find_ncbi_gff_url_async(session, accession):
-    acc_base = accession.split(".")[0]
-    # NCBI eSearch
-    try:
-        async with session.get(
-            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
-            params={"db": "assembly", "term": acc_base, "retmode": "json"},
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as r:
-            data = await r.json(content_type=None)
-            ids = data.get("esearchresult", {}).get("idlist", [])
-            if ids:
-                async with session.get(
-                    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
-                    params={"db": "assembly", "id": ids[0], "retmode": "json"},
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as r2:
-                    data2 = await r2.json(content_type=None)
-                    doc = data2.get("result", {}).get(ids[0], {})
-                    ftp = doc.get("ftppath_refseq") or doc.get("ftppath_genbank")
-                    if ftp:
-                        ftp = ftp.replace("ftp://", "https://")
-                        async with session.get(ftp + "/", timeout=aiohttp.ClientTimeout(total=15)) as r3:
-                            text = await r3.text()
-                            files = re.findall(r'href="([^"]+genomic\.gff\.gz)"', text)
-                            if files:
-                                fname = files[0]
-                                return fname if fname.startswith("http") else ftp + "/" + fname
-    except Exception:
-        pass
-
-    # FTP doğrudan dene
-    digits = re.sub(r"\D", "", acc_base)
-    if len(digits) >= 9:
-        d1, d2, d3 = digits[:3], digits[3:6], digits[6:9]
-        for prefix in ["GCF", "GCA"]:
-            ftp_base = f"https://ftp.ncbi.nlm.nih.gov/genomes/all/{prefix}/{d1}/{d2}/{d3}/"
-            try:
-                async with session.get(ftp_base, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    if r.status != 200:
-                        continue
-                    text = await r.text()
-                    folders = re.findall(r'href="([^"\']+/)"', text)
-                    for folder in folders:
-                        folder = folder.strip("/")
-                        if acc_base in folder:
-                            folder_url = ftp_base + folder + "/"
-                            async with session.get(folder_url, timeout=aiohttp.ClientTimeout(total=15)) as r2:
-                                text2 = await r2.text()
-                                files = re.findall(r'href="([^"\']+genomic\.gff\.gz)"', text2)
-                                if files:
-                                    fname = files[0]
-                                    return fname if fname.startswith("http") else folder_url + fname
-            except Exception:
-                continue
-    return None
-
-async def download_annotation_async(session, accession):
-    """Cache → DSMZ CDN GBFF → NCBI GFF sırasıyla dene."""
-    cached = cache_get(accession)
-    if cached:
-        print(f"[CACHE] {accession}")
-        return cached[0], cached[1]
-
-    acc_base = accession.split(".")[0]
-
-    # 1. DSMZ CDN Bakta GBFF
-    for url in [f"{CDN_BASE}/{acc_base}.gbff", f"{CDN_BASE}/{accession}.gbff",
-                f"{CDN_BASE}/{acc_base}.gbff.gz", f"{CDN_BASE}/{accession}.gbff.gz"]:
-        content = await fetch_url_async(session, url, timeout=40)
-        if content:
-            cache_set(accession, (content, "BacDive Bakta annotation"))
-            print(f"[GBFF] {accession}")
-            return content, "BacDive Bakta annotation"
-
-    # 2. NCBI GFF
-    gff_url = await find_ncbi_gff_url_async(session, accession)
-    if gff_url:
-        content = await fetch_url_async(session, gff_url, timeout=60)
-        if content:
-            cache_set(accession, (content, "NCBI GFF annotation"))
-            print(f"[GFF] {accession}")
-            return content, "NCBI GFF annotation"
-
-    return None, None
-
-# ─── SYNC WRAPPERS (Mod 1) ───────────────────────────────────────────────────
-
-def fetch_gbff_features(accession, product_query):
-    acc_base = accession.split(".")[0]
-    for url in [f"{CDN_BASE}/{acc_base}.gbff", f"{CDN_BASE}/{accession}.gbff",
-                f"{CDN_BASE}/{acc_base}.gbff.gz", f"{CDN_BASE}/{accession}.gbff.gz"]:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=40)
-            if r.ok:
-                raw = r.content
-                content = gzip.decompress(raw).decode("utf-8", errors="replace") \
-                          if url.endswith(".gz") else raw.decode("utf-8", errors="replace")
-                return parse_gbff(content, [product_query]), None
-        except Exception:
-            continue
-    return None, "GBFF indirilemedi"
+# ─── ANNOTATION DOWNLOAD ─────────────────────────────────────────────────────
 
 def find_ncbi_gff(accession):
     acc_base = accession.split(".")[0]
@@ -355,12 +239,42 @@ def find_ncbi_gff(accession):
                 continue
     return None
 
-def search_ncbi_gff(gff_url, product_query):
-    r = requests.get(gff_url, headers=HEADERS, timeout=60)
-    raw = r.content
-    content = gzip.decompress(raw).decode("utf-8", errors="replace") \
-              if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
-    return parse_gff(content, [product_query])
+def download_annotation(accession):
+    """Cache → DSMZ CDN GBFF → NCBI GFF"""
+    cached = cache_get(accession)
+    if cached:
+        return cached[0], cached[1]
+
+    acc_base = accession.split(".")[0]
+
+    # 1. DSMZ CDN Bakta GBFF
+    for url in [f"{CDN_BASE}/{acc_base}.gbff", f"{CDN_BASE}/{accession}.gbff",
+                f"{CDN_BASE}/{acc_base}.gbff.gz", f"{CDN_BASE}/{accession}.gbff.gz"]:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=40)
+            if r.ok:
+                raw = r.content
+                content = gzip.decompress(raw).decode("utf-8", errors="replace") \
+                          if url.endswith(".gz") else raw.decode("utf-8", errors="replace")
+                cache_set(accession, (content, "BacDive Bakta annotation"))
+                return content, "BacDive Bakta annotation"
+        except Exception:
+            continue
+
+    # 2. NCBI GFF
+    gff_url = find_ncbi_gff(accession)
+    if gff_url:
+        try:
+            r = requests.get(gff_url, headers=HEADERS, timeout=60)
+            raw = r.content
+            content = gzip.decompress(raw).decode("utf-8", errors="replace") \
+                      if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
+            cache_set(accession, (content, "NCBI GFF annotation"))
+            return content, "NCBI GFF annotation"
+        except Exception as e:
+            print(f"[WARN] GFF indirme: {e}")
+
+    return None, None
 
 # ─── ENDPOINTS ────────────────────────────────────────────────────────────────
 
@@ -428,50 +342,22 @@ def search_product():
             accession = find_accession_via_ncbi(strain_name)
     if not accession:
         return jsonify({"found": False, "error_code": "NO_ASSEMBLY",
-                        "message": "Genome assembly bulunamadi."})
+                        "message": "Bu BacDive kaydinda genome assembly accession bulunamadi ve NCBI'da da bulunamadi."})
 
     product_queries = [p.strip() for p in product_q.split(",") if p.strip()]
-
-    # Annotation'ı indir (cache'den veya CDN/NCBI'dan)
-    content = None
-    source  = None
-
-    acc_base = accession.split(".")[0]
-    for url in [f"{CDN_BASE}/{acc_base}.gbff", f"{CDN_BASE}/{accession}.gbff",
-                f"{CDN_BASE}/{acc_base}.gbff.gz", f"{CDN_BASE}/{accession}.gbff.gz"]:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=40)
-            if r.ok:
-                raw = r.content
-                content = gzip.decompress(raw).decode("utf-8", errors="replace") \
-                          if url.endswith(".gz") else raw.decode("utf-8", errors="replace")
-                source = "BacDive Bakta annotation"
-                break
-        except Exception:
-            continue
+    content, source = download_annotation(accession)
 
     if content is None:
-        gff_url = find_ncbi_gff(accession)
-        if not gff_url:
-            return jsonify({"found": False, "error_code": "NO_GFF_URL",
-                            "message": f"Annotation indirilemedi. Accession: {accession}",
-                            "accession": accession})
-        try:
-            r = requests.get(gff_url, headers=HEADERS, timeout=60)
-            raw = r.content
-            content = gzip.decompress(raw).decode("utf-8", errors="replace") \
-                      if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
-            source = "NCBI GFF annotation"
-        except Exception as e:
-            return jsonify({"found": False, "error_code": "DOWNLOAD_ERROR",
-                            "message": str(e), "accession": accession})
+        return jsonify({"found": False, "error_code": "NO_GFF_URL",
+                        "message": f"Annotation indirilemedi. Accession: {accession}",
+                        "accession": accession})
 
-    # Multi-keyword parse
     matches = parse_content(content, product_queries)
 
     if not matches:
         return jsonify({"found": False, "error_code": "NO_PRODUCT",
-                        "message": f"'{product_q}' bulunamadi.", "accession": accession})
+                        "message": f"'{product_q}' bulunamadi.",
+                        "accession": accession, "source": source})
     return jsonify({"found": True, "accession": accession, "bacdive_id": bid,
                     "product_query": product_q, "total": len(matches),
                     "source": source, "results": matches})
@@ -495,122 +381,25 @@ def protein_sequence():
     return jsonify({"found": False, "message": "Sekans bulunamadi."})
 
 
-# ─── MOD 2: Paralel async tarama (SSE) ───────────────────────────────────────
+# ─── MOD 2: SSE stream + ThreadPoolExecutor ───────────────────────────────────
 
 def sse_event(data):
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-
-async def scan_all_async(organisms, product_queries, queue):
-    """
-    Tüm strainleri async olarak tara.
-    Sonuçları queue'ya koy — Flask SSE generator oradan okur.
-    """
-    connector = aiohttp.TCPConnector(limit=10)
-    async with aiohttp.ClientSession(connector=connector) as session:
-
-        for org in organisms:
-            await queue.put(sse_event({"type": "status",
-                                       "message": f"'{org}' BacDive'da aranıyor..."}))
-            try:
-                hits = search_organism(org)  # sync, BacDive client thread-safe değil
-            except Exception as e:
-                await queue.put(sse_event({"type": "error",
-                                           "message": f"BacDive hatası ({org}): {e}"}))
-                continue
-
-            if not hits:
-                await queue.put(sse_event({"type": "error",
-                                           "message": f"'{org}' için kayıt bulunamadı."}))
-                continue
-
-            with_asm, no_asm = [], []
-            for h in hits:
-                acc = find_accession(h["raw"])
-                if acc:
-                    with_asm.append((h, acc))
-                else:
-                    no_asm.append(h)
-
-            await queue.put(sse_event({
-                "type": "summary", "organism": org,
-                "total_strains": len(hits),
-                "with_assembly": len(with_asm),
-                "no_assembly":   len(no_asm),
-            }))
-
-            for h in no_asm:
-                await queue.put(sse_event({
-                    "type": "skip", "organism": org,
-                    "strain_name": h["name"], "bacdive_id": h["id"],
-                    "reason": "Assembly yok",
-                }))
-
-            total = len(with_asm)
-            found_count = 0
-
-            # Tüm strainleri aynı anda async indir, sonuç geldikçe SSE'ye yaz
-            async def scan_one(h, accession, idx):
-                nonlocal found_count
-                strain_name = h["name"]
-                bid         = h["id"]
-
-                await queue.put(sse_event({
-                    "type":        "scanning",
-                    "organism":    org,
-                    "strain_name": strain_name,
-                    "accession":   accession,
-                    "bacdive_id":  bid,
-                    "progress":    idx + 1,
-                    "total":       total,
-                }))
-
-                content, source = await download_annotation_async(session, accession)
-
-                if content is None:
-                    await queue.put(sse_event({
-                        "type": "skip", "organism": org,
-                        "strain_name": strain_name, "accession": accession,
-                        "bacdive_id": bid, "reason": "Annotation indirilemedi",
-                    }))
-                    return
-
-                matches = parse_content(content, product_queries)
-
-                if not matches:
-                    await queue.put(sse_event({
-                        "type": "not_found", "organism": org,
-                        "strain_name": strain_name, "accession": accession,
-                        "bacdive_id": bid,
-                    }))
-                    return
-
-                found_count += 1
-                await queue.put(sse_event({
-                    "type":        "found",
-                    "organism":    org,
-                    "strain_name": strain_name,
-                    "accession":   accession,
-                    "bacdive_id":  bid,
-                    "bacdive_url": f"{BACDIVE_WEB}/{bid}",
-                    "source":      source,
-                    "match_count": len(matches),
-                    "results":     matches,
-                }))
-
-            # Hepsini aynı anda başlat
-            tasks = [scan_one(h, acc, idx) for idx, (h, acc) in enumerate(with_asm)]
-            await asyncio.gather(*tasks)
-
-            await queue.put(sse_event({
-                "type":          "done",
-                "organism":      org,
-                "total_scanned": total,
-                "found_count":   found_count,
-                "message":       f"'{org}' tamamlandı: {total} strain, {found_count} pozitif.",
-            }))
-
-    await queue.put(None)  # sentinel — bitti
+def scan_one_strain(h, accession, product_queries, org):
+    """Tek strain tara — thread içinde çağrılır."""
+    content, source = download_annotation(accession)
+    if content is None:
+        return {"status": "skip", "strain_name": h["name"], "accession": accession,
+                "bacdive_id": h["id"], "organism": org, "reason": "Annotation indirilemedi"}
+    matches = parse_content(content, product_queries)
+    if not matches:
+        return {"status": "not_found", "strain_name": h["name"], "accession": accession,
+                "bacdive_id": h["id"], "organism": org}
+    return {"status": "found", "strain_name": h["name"], "accession": accession,
+            "bacdive_id": h["id"], "organism": org,
+            "bacdive_url": f"{BACDIVE_WEB}/{h['id']}",
+            "source": source, "match_count": len(matches), "results": matches}
 
 
 @app.route("/scan-organism", methods=["GET"])
@@ -624,52 +413,91 @@ def scan_organism():
     product_queries = [p.strip() for p in product_raw.split(",") if p.strip()]
 
     def generate():
-        # asyncio event loop'u ayrı thread'de çalıştır
-        q = None
-        loop = asyncio.new_event_loop()
+        for org in organisms:
+            yield sse_event({"type": "status", "message": f"'{org}' BacDive'da aranıyor..."})
 
-        import queue as stdlib_queue
-        q = stdlib_queue.Queue()
+            try:
+                hits = search_organism(org)
+            except Exception as e:
+                yield sse_event({"type": "error", "message": f"BacDive hatası: {e}"})
+                continue
 
-        async def run():
-            aqueue = asyncio.Queue()
-            # async queue → sync queue köprüsü
-            async def bridge():
-                while True:
-                    item = await aqueue.get()
-                    q.put(item)
-                    if item is None:
-                        break
-            await asyncio.gather(
-                scan_all_async(organisms, product_queries, aqueue),
-                bridge()
-            )
+            if not hits:
+                yield sse_event({"type": "error", "message": f"'{org}' bulunamadı."})
+                continue
 
-        def run_loop():
-            loop.run_until_complete(run())
+            with_asm, no_asm = [], []
+            for h in hits:
+                acc = find_accession(h["raw"])
+                if acc:
+                    with_asm.append((h, acc))
+                else:
+                    no_asm.append(h)
 
-        t = threading.Thread(target=run_loop, daemon=True)
-        t.start()
+            yield sse_event({
+                "type": "summary", "organism": org,
+                "total_strains": len(hits),
+                "with_assembly": len(with_asm),
+                "no_assembly":   len(no_asm),
+            })
 
-        while True:
-            item = q.get()
-            if item is None:
-                break
-            yield item
+            for h in no_asm:
+                yield sse_event({"type": "skip", "organism": org,
+                                 "strain_name": h["name"], "bacdive_id": h["id"],
+                                 "reason": "Assembly yok"})
+
+            total       = len(with_asm)
+            found_count = 0
+            done_count  = 0
+
+            # Paralel indir, sonuç geldikçe SSE'ye yaz
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_strain = {
+                    executor.submit(scan_one_strain, h, acc, product_queries, org): (h, acc)
+                    for h, acc in with_asm
+                }
+
+                # Önce hepsini "scanning" olarak bildir
+                for h, acc in with_asm:
+                    yield sse_event({
+                        "type": "scanning", "organism": org,
+                        "strain_name": h["name"], "accession": acc,
+                        "bacdive_id": h["id"], "progress": 0, "total": total,
+                    })
+
+                # Sonuçlar geldikçe yaz
+                for future in as_completed(future_to_strain):
+                    done_count += 1
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        h, acc = future_to_strain[future]
+                        result = {"status": "skip", "strain_name": h["name"],
+                                  "accession": acc, "bacdive_id": h["id"],
+                                  "organism": org, "reason": str(e)}
+
+                    result["progress"] = done_count
+                    result["total"]    = total
+                    if result["status"] == "found":
+                        found_count += 1
+                    yield sse_event(result)
+
+            yield sse_event({
+                "type": "done", "organism": org,
+                "total_scanned": total, "found_count": found_count,
+                "message": f"'{org}' tamamlandı: {total} strain, {found_count} pozitif.",
+            })
 
     return Response(
         stream_with_context(generate()),
         mimetype="text/event-stream",
-        headers={
-            "Cache-Control":             "no-cache",
-            "X-Accel-Buffering":         "no",
-            "Access-Control-Allow-Origin":"*",
-        }
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "Access-Control-Allow-Origin": "*"}
     )
 
 
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 5050))
-    print(f"DeepDive async backend http://localhost:{port}")
+    print(f"DeepDive backend http://localhost:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
