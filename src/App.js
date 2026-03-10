@@ -456,26 +456,19 @@ function HistoryPanel({ history, onSelect, onRemove, t }) {
 
 // ─── MOD 2 ───────────────────────────────────────────────────────────────────
 function ScanMode2({ t, addHistory }) {
-  const [orgTags,     setOrgTags]     = useState([]);
-  const [prodTags,    setProdTags]    = useState([]);
-  const [scanning,    setScanning]    = useState(false);
-  const [items,       setItems]       = useState([]);
-  const [summary,     setSummary]     = useState(null);
-  const [done,        setDone]        = useState(null);
-  const [progress,    setProgress]    = useState({ current:0, total:0 });
-  const [expandedIds, setExpandedIds] = useState(new Set());
-  const [filter,      setFilter]      = useState("all"); // all | found | notfound | skip
-  const esRef    = useRef(null);
+  const [orgTags,  setOrgTags]  = useState([]);
+  const [prodTags, setProdTags] = useState([]);
+  const [scanning, setScanning] = useState(false);
+  const [items,    setItems]    = useState([]);  // tüm strainler, kalıcı liste
+  const [progress, setProgress] = useState({ current: 0, total: 0 });
+  const [done,     setDone]     = useState(null);
+  const [filter,   setFilter]   = useState("all"); // all | found | notfound | skip
+  const esRef     = useRef(null);
   const bottomRef = useRef(null);
-
-  function toggleExpand(id) {
-    setExpandedIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
-  }
 
   function reset() {
     if (esRef.current) { esRef.current.close(); esRef.current = null; }
-    setScanning(false); setItems([]); setSummary(null); setDone(null);
-    setProgress({current:0,total:0}); setExpandedIds(new Set());
+    setScanning(false); setItems([]); setProgress({ current: 0, total: 0 }); setDone(null);
   }
 
   function startScan() {
@@ -490,161 +483,199 @@ function ScanMode2({ t, addHistory }) {
 
     es.onmessage = (e) => {
       const data = JSON.parse(e.data);
-      if (data.type === "organism_summary") setSummary(s => ({ ...(s||{}), [data.organism]: data }));
-      else if (data.type === "scan_start") setProgress({ current:0, total: data.total });
-      else if (data.type === "scanning") {
-        setProgress(p => ({...p, current: data.progress}));
-        // Sadece aktif taranan item'ı göster — önceki "scanning" olanı kaldır, yenisini ekle
+      const id = `s_${data.bacdive_id}`;
+
+      if (data.type === "scan_start") {
+        setProgress({ current: 0, total: data.total });
+
+      } else if (data.type === "scanning") {
+        // Strain listeye eklenir, "taranıyor" durumunda
+        setProgress(p => ({ ...p, current: data.progress }));
         setItems(prev => {
-          const withoutScanning = prev.filter(i => i.status !== "scanning");
-          return [...withoutScanning, {
-            id: `s_${data.bacdive_id}`, status: "scanning",
-            strain_name: data.strain_name, accession: data.accession,
-            bacdive_id: data.bacdive_id, organism: data.organism
+          if (prev.find(i => i.id === id)) return prev; // zaten varsa ekleme
+          return [...prev, {
+            id, status: "scanning",
+            strain_name: data.strain_name,
+            accession: data.accession,
+            bacdive_id: data.bacdive_id,
+            organism: data.organism,
           }];
         });
-        setTimeout(() => bottomRef.current?.scrollIntoView({behavior:"smooth"}), 50);
-      }
-      else if (data.type === "found") {
-        setProgress(p => ({...p, current: data.progress||p.current}));
-        setItems(prev => prev.map(i => i.id===`s_${data.bacdive_id}` ? {...i, status:"found",...data} : i));
-      }
-      else if (data.type === "not_found") {
-        setItems(prev => prev.map(i => i.id===`s_${data.bacdive_id}` ? {...i, status:"notfound"} : i));
-      }
-      else if (data.type === "skip") {
+        setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+
+      } else if (data.type === "found") {
+        setProgress(p => ({ ...p, current: data.progress || p.current }));
+        setItems(prev => prev.map(i => i.id === id
+          ? { ...i, status: "found", match_count: data.match_count, results: data.results,
+              source: data.source, bacdive_url: data.bacdive_url }
+          : i
+        ));
+
+      } else if (data.type === "not_found") {
+        setProgress(p => ({ ...p, current: data.progress || p.current }));
+        setItems(prev => prev.map(i => i.id === id ? { ...i, status: "notfound" } : i));
+
+      } else if (data.type === "skip") {
+        // Assembly yoksa scanning eventi gelmez, direkt skip gelir — listeye ekle
         setItems(prev => {
-          const ex = prev.find(i => i.id===`s_${data.bacdive_id}`);
-          const upd = { id:`s_${data.bacdive_id}`, status:"skip", strain_name:data.strain_name,
-            accession:data.accession, bacdive_id:data.bacdive_id, reason:data.reason, organism:data.organism };
-          return ex ? prev.map(i => i.id===`s_${data.bacdive_id}` ? upd : i) : [...prev, upd];
+          const exists = prev.find(i => i.id === id);
+          const item = { id, status: "skip", strain_name: data.strain_name,
+            accession: data.accession, bacdive_id: data.bacdive_id,
+            reason: data.reason, organism: data.organism };
+          return exists
+            ? prev.map(i => i.id === id ? item : i)
+            : [...prev, item];
         });
+
+      } else if (data.type === "done") {
+        setDone(data); setScanning(false); es.close(); esRef.current = null;
+
+      } else if (data.type === "error") {
+        setDone({ error: true, message: data.message });
+        setScanning(false); es.close(); esRef.current = null;
       }
-      else if (data.type === "done") { setDone(data); setScanning(false); es.close(); esRef.current=null; }
-      else if (data.type === "error") { setDone({error:true,message:data.message}); setScanning(false); es.close(); esRef.current=null; }
     };
-    es.onerror = () => { setScanning(false); es.close(); esRef.current=null; };
+
+    es.onerror = () => { setScanning(false); es.close(); esRef.current = null; };
   }
 
-  const pct      = progress.total > 0 ? Math.round((progress.current/progress.total)*100) : 0;
-  const filtered = filter === "all" ? items
-    : filter === "found"    ? items.filter(i => i.status==="found")
-    : filter === "notfound" ? items.filter(i => i.status==="notfound")
-    : items.filter(i => i.status==="skip");
-  const foundCount = items.filter(i => i.status==="found").length;
+  const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+
+  const counts = {
+    all:      items.length,
+    found:    items.filter(i => i.status === "found").length,
+    notfound: items.filter(i => i.status === "notfound").length,
+    skip:     items.filter(i => i.status === "skip").length,
+  };
+
+  const filtered = filter === "all"      ? items
+    : filter === "found"    ? items.filter(i => i.status === "found")
+    : filter === "notfound" ? items.filter(i => i.status === "notfound")
+    : items.filter(i => i.status === "skip");
 
   return (
     <div className="card">
       <div className="card-label">02 — Cins Taraması</div>
 
+      {/* Input */}
       <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
         <div>
           <TagsInput tags={orgTags} setTags={setOrgTags}
-            placeholder="Organizma ekle ve Enter'a bas… (örn: halomonas)" disabled={scanning} />
+            placeholder="Organizma ekle, Enter'a bas… (örn: halomonas)" disabled={scanning} />
           <div className="input-hint">Birden fazla organizma için her birini girdikten sonra Enter'a bas</div>
         </div>
         <div>
           <TagsInput tags={prodTags} setTags={setProdTags}
-            placeholder="Product ekle ve Enter'a bas… (örn: levan)" disabled={scanning} />
+            placeholder="Product ekle, Enter'a bas… (örn: levan)" disabled={scanning} />
           <div className="input-hint">Birden fazla keyword girilebilir</div>
         </div>
         <div style={{display:"flex",gap:8}}>
-          <button className="btn btn-primary" style={{flex:1,justifyContent:"center",
-            ...(scanning ? {background:t.error,color:"#fff"} : {})}}
+          <button className="btn btn-primary"
+            style={{flex:1, justifyContent:"center", ...(scanning ? {background:t.error,color:"#fff"} : {})}}
             onClick={scanning ? reset : startScan}
             disabled={!scanning && (!orgTags.length || !prodTags.length)}>
             {scanning ? <><IconX/> Durdur</> : <><IconSearch/> Tara</>}
           </button>
-          {(items.length > 0 || done) && !scanning && (
+          {items.length > 0 && !scanning && (
             <button className="btn btn-ghost" onClick={reset}>Temizle</button>
           )}
         </div>
       </div>
 
-      {/* Progress */}
-      {(scanning || done) && progress.total > 0 && (
-        <div className="scan-progress-bar">
-          <div className="scan-progress-fill" style={{width:`${pct}%`}} />
+      {/* Progress bar */}
+      {progress.total > 0 && (
+        <div style={{marginBottom:8}}>
+          <div style={{display:"flex",justifyContent:"space-between",
+            fontFamily:"IBM Plex Mono,monospace",fontSize:10,color:t.textDim,marginBottom:4}}>
+            <span>{scanning ? `Taranıyor… ${progress.current}/${progress.total}` : `Tamamlandı — ${progress.total} strain`}</span>
+            <span style={{color:t.accent}}>{pct}%</span>
+          </div>
+          <div className="scan-progress-bar">
+            <div className="scan-progress-fill" style={{width:`${pct}%`}} />
+          </div>
         </div>
       )}
 
-      {/* Summary */}
-      {summary && Object.entries(summary).map(([key, s]) => (
-        <div key={s.organism} style={{marginTop:10, padding:"8px 12px", border:`1px solid ${t.border}`,
-          borderRadius:3, background:t.bg, fontFamily:"IBM Plex Mono,monospace", fontSize:11, color:t.textMuted}}>
-          <b style={{color:t.accent}}>{s.organism}</b>: {s.total_strains} strain —{" "}
-          <span style={{color:t.accent}}>{s.with_assembly} assembly</span>,{" "}
-          <span style={{color:t.warn}}>{s.no_assembly} assembly yok</span>
-          {scanning && <span style={{color:t.textDim}}> — taranıyor...</span>}
-        </div>
-      ))}
-
       {/* Filter toolbar */}
       {items.length > 0 && (
-        <div className="scan-toolbar" style={{marginTop:12}}>
-          <span style={{fontFamily:"IBM Plex Mono,monospace",fontSize:10,color:t.textDim}}>FİLTRE:</span>
-          {[["all","Tümü"],["found","✓ Bulundu"],["notfound","∅ Yok"],["skip","— Atlandı"]].map(([v,l]) => (
-            <button key={v} className={`scan-filter-btn ${filter===v?"active":""}`} onClick={() => setFilter(v)}>
-              {l} {v==="all" ? `(${items.length})` : v==="found" ? `(${items.filter(i=>i.status==="found").length})`
-                : v==="notfound" ? `(${items.filter(i=>i.status==="notfound").length})`
-                : `(${items.filter(i=>i.status==="skip").length})`}
+        <div className="scan-toolbar">
+          {[
+            ["all",      "Tümü",       counts.all],
+            ["found",    "✓ Bulundu",  counts.found],
+            ["notfound", "∅ Yok",      counts.notfound],
+            ["skip",     "— Atlandı",  counts.skip],
+          ].map(([v, l, c]) => (
+            <button key={v} className={`scan-filter-btn ${filter===v?"active":""}`}
+              onClick={() => setFilter(v)}>
+              {l} ({c})
             </button>
           ))}
         </div>
       )}
 
-      {/* Items */}
+      {/* Strain listesi */}
       {filtered.length > 0 && (
-        <div className="scan-list" style={{marginTop:8}}>
+        <div className="scan-list">
           {filtered.map(item => (
             <div key={item.id} className={`scan-item scan-item-${item.status}`}>
+
+              {/* Strain başlık satırı */}
               <div className="scan-item-header">
-                <div>
-                  {item.organism && <span style={{fontSize:10,color:t.textDim,marginRight:6}}>[{item.organism}]</span>}
+                <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                  {item.organism && (
+                    <span style={{fontSize:10,color:t.textDim,fontFamily:"IBM Plex Mono,monospace"}}>
+                      [{item.organism}]
+                    </span>
+                  )}
                   <span className="scan-strain-name">{item.strain_name}</span>
                 </div>
-                {item.status==="found"    && <span className="scan-badge scan-badge-found">✓ {item.match_count} GEN</span>}
-                {item.status==="scanning" && <span className="scan-badge scan-badge-scanning">⏳ taranıyor</span>}
-                {item.status==="skip"     && <span className="scan-badge scan-badge-skip">— {item.reason||"atlandı"}</span>}
-                {item.status==="notfound" && <span className="scan-badge scan-badge-notfound">∅ eşleşme yok</span>}
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  {item.status === "scanning"  && <span className="scan-badge scan-badge-scanning">⏳ taranıyor</span>}
+                  {item.status === "found"     && <span className="scan-badge scan-badge-found">✓ {item.match_count} gen</span>}
+                  {item.status === "notfound"  && <span className="scan-badge scan-badge-notfound">∅ eşleşme yok</span>}
+                  {item.status === "skip"      && <span className="scan-badge scan-badge-skip">— {item.reason || "atlandı"}</span>}
+                </div>
               </div>
-              {(item.accession||item.bacdive_id) && (
+
+              {/* Meta bilgiler */}
+              {(item.bacdive_id || item.accession) && (
                 <div className="scan-meta">
                   {item.bacdive_id && <span>BacDive: <b>{item.bacdive_id}</b></span>}
                   {item.accession  && <span className="blue">Assembly: <b>{item.accession}</b></span>}
                   {item.source     && <span>Kaynak: <b style={{color:t.blue}}>{item.source}</b></span>}
                   {item.bacdive_url && (
-                    <span><a href={item.bacdive_url} target="_blank" rel="noreferrer"
-                      style={{color:t.accent,textDecoration:"none",borderBottom:`1px dashed ${t.accentDim.replace("0.1","0.4")}`}}>
+                    <a href={item.bacdive_url} target="_blank" rel="noreferrer"
+                      style={{color:t.accent,textDecoration:"none",
+                        borderBottom:`1px dashed ${t.accentDim.replace("0.1","0.4")}`}}>
                       BacDive ↗
-                    </a></span>
+                    </a>
                   )}
                 </div>
               )}
-              {item.status==="found" && item.results && (
-                <>
-                  <button className="scan-toggle-btn" onClick={() => toggleExpand(item.id)}>
-                    {expandedIds.has(item.id) ? "▲ Gizle" : `▼ ${item.match_count} geni göster`}
-                  </button>
-                  {expandedIds.has(item.id) && (
-                    <div style={{marginTop:8}}>
-                      <FeatureTable rows={item.results} t={t} />
-                    </div>
-                  )}
-                </>
+
+              {/* Gen tablosu — bulununca otomatik açık */}
+              {item.status === "found" && item.results && (
+                <div style={{marginTop:10}}>
+                  <FeatureTable rows={item.results} t={t} />
+                </div>
               )}
             </div>
           ))}
         </div>
       )}
 
+      {/* Tamamlandı banner */}
       {done && !done.error && (
         <div className="scan-done-banner">
           <IconCheck/>
-          <span>Tamamlandı — <b>{done.total_scanned}</b> strain, <b>{done.found_count}</b> pozitif.</span>
+          <span>
+            Tamamlandı — <b>{done.total_scanned}</b> strain tarandı,{" "}
+            <b style={{color:t.accent}}>{done.found_count}</b> pozitif.
+          </span>
         </div>
       )}
       {done?.error && <StatusMsg type="error">{done.message}</StatusMsg>}
+
       <div ref={bottomRef} />
     </div>
   );
