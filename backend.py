@@ -21,22 +21,48 @@ HEADERS = {
     "Referer":    "https://bacdive.dsmz.de/",
 }
 
-# ─── IN-MEMORY CACHE ──────────────────────────────────────────────────────────
-# { accession: {"content": str, "ts": float} }
+# ─── DISK + MEMORY CACHE ─────────────────────────────────────────────────────
+import os, hashlib, pickle
+
+CACHE_DIR = "/tmp/deepdive_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 _annotation_cache: dict = {}
 _cache_lock = threading.Lock()
-CACHE_TTL = 60 * 60 * 6  # 6 saat
+CACHE_TTL = 60 * 60 * 24 * 30  # 30 gün
+
+def _cache_path(accession: str) -> str:
+    key = hashlib.md5(accession.encode()).hexdigest()
+    return os.path.join(CACHE_DIR, f"{key}.pkl")
 
 def cache_get(accession: str):
     with _cache_lock:
+        # Önce memory
         entry = _annotation_cache.get(accession)
         if entry and (time.time() - entry["ts"]) < CACHE_TTL:
             return entry["content"]
+        # Sonra disk
+        path = _cache_path(accession)
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    entry = pickle.load(f)
+                if (time.time() - entry["ts"]) < CACHE_TTL:
+                    _annotation_cache[accession] = entry
+                    return entry["content"]
+            except Exception:
+                pass
         return None
 
 def cache_set(accession: str, content: str):
     with _cache_lock:
-        _annotation_cache[accession] = {"content": content, "ts": time.time()}
+        entry = {"content": content, "ts": time.time()}
+        _annotation_cache[accession] = entry
+        try:
+            path = _cache_path(accession)
+            with open(path, "wb") as f:
+                pickle.dump(entry, f)
+        except Exception:
+            pass
 
 # ─── BacDive ──────────────────────────────────────────────────────────────────
 
@@ -487,13 +513,20 @@ def sse_event(data: dict) -> str:
 
 
 def _scan_single(h, accession, product_queries, org_label):
-    """Tek bir strain'i tara — 60s timeout ile."""
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+    """Tek bir strain'i tara — signal ile 90s hard timeout."""
+    import signal
+
     strain_name = h["name"]
     bid         = h["id"]
 
-    def _do():
+    def _timeout_handler(signum, frame):
+        raise TimeoutError(f"90s aşıldı: {strain_name}")
+
+    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(90)
+    try:
         content, source = _download_annotation(accession)
+        signal.alarm(0)
         if content is None:
             return {"status": "skip", "strain_name": strain_name,
                     "accession": accession, "bacdive_id": bid,
@@ -513,20 +546,22 @@ def _scan_single(h, accession, product_queries, org_label):
             "results":     matches,
             "organism":    org_label,
         }
+    except TimeoutError:
+        signal.alarm(0)
+        print(f"[TIMEOUT] {strain_name} ({accession}) 90s aşıldı, atlanıyor")
+        return {"status": "skip", "strain_name": strain_name,
+                "accession": accession, "bacdive_id": bid,
+                "reason": "Timeout (90s)", "organism": org_label}
+    except Exception as e:
+        signal.alarm(0)
+        return {"status": "skip", "strain_name": strain_name,
+                "accession": accession, "bacdive_id": bid,
+                "reason": str(e), "organism": org_label}
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)
 
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        future = ex.submit(_do)
-        try:
-            return future.result(timeout=60)
-        except FuturesTimeout:
-            print(f"[TIMEOUT] {strain_name} ({accession}) 60s aşıldı")
-            return {"status": "skip", "strain_name": strain_name,
-                    "accession": accession, "bacdive_id": bid,
-                    "reason": "Timeout (60s)", "organism": org_label}
-        except Exception as e:
-            return {"status": "skip", "strain_name": strain_name,
-                    "accession": accession, "bacdive_id": bid,
-                    "reason": str(e), "organism": org_label}
+
+
 
 
 @app.route("/scan-organism", methods=["GET"])
