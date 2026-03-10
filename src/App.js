@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import * as XLSX from "https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs";
+import * as XLSX from "xlsx";
 
 const API_BASE = "https://deepdive-backend-6nza.onrender.com";
 
