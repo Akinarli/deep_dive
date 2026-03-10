@@ -21,48 +21,22 @@ HEADERS = {
     "Referer":    "https://bacdive.dsmz.de/",
 }
 
-# ─── DISK + MEMORY CACHE ─────────────────────────────────────────────────────
-import os, hashlib, pickle
-
-CACHE_DIR = "/tmp/deepdive_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
+# ─── IN-MEMORY CACHE ──────────────────────────────────────────────────────────
+# { accession: {"content": str, "ts": float} }
 _annotation_cache: dict = {}
 _cache_lock = threading.Lock()
-CACHE_TTL = 60 * 60 * 24 * 30  # 30 gün
-
-def _cache_path(accession: str) -> str:
-    key = hashlib.md5(accession.encode()).hexdigest()
-    return os.path.join(CACHE_DIR, f"{key}.pkl")
+CACHE_TTL = 60 * 60 * 6  # 6 saat
 
 def cache_get(accession: str):
     with _cache_lock:
-        # Önce memory
         entry = _annotation_cache.get(accession)
         if entry and (time.time() - entry["ts"]) < CACHE_TTL:
             return entry["content"]
-        # Sonra disk
-        path = _cache_path(accession)
-        if os.path.exists(path):
-            try:
-                with open(path, "rb") as f:
-                    entry = pickle.load(f)
-                if (time.time() - entry["ts"]) < CACHE_TTL:
-                    _annotation_cache[accession] = entry
-                    return entry["content"]
-            except Exception:
-                pass
         return None
 
 def cache_set(accession: str, content: str):
     with _cache_lock:
-        entry = {"content": content, "ts": time.time()}
-        _annotation_cache[accession] = entry
-        try:
-            path = _cache_path(accession)
-            with open(path, "wb") as f:
-                pickle.dump(entry, f)
-        except Exception:
-            pass
+        _annotation_cache[accession] = {"content": content, "ts": time.time()}
 
 # ─── BacDive ──────────────────────────────────────────────────────────────────
 
@@ -102,7 +76,7 @@ def find_accession_via_ncbi(organism_name: str) -> str | None:
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
             params={"db": "assembly", "term": f"{organism_name}[Organism]",
                     "retmode": "json", "retmax": 5, "sort": "submissiondate desc"},
-            timeout=(8, 15))
+            timeout=15)
         if not es.ok:
             return None
         ids = es.json().get("esearchresult", {}).get("idlist", [])
@@ -110,7 +84,7 @@ def find_accession_via_ncbi(organism_name: str) -> str | None:
             return None
         esummary = requests.get(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
-            params={"db": "assembly", "id": ids[0], "retmode": "json"}, timeout=(8, 15))
+            params={"db": "assembly", "id": ids[0], "retmode": "json"}, timeout=15)
         if not esummary.ok:
             return None
         doc = esummary.json().get("result", {}).get(ids[0], {})
@@ -137,7 +111,7 @@ def _download_annotation(accession: str) -> tuple[str | None, str]:
     for url in [f"{CDN_BASE}/{acc_base}.gbff", f"{CDN_BASE}/{accession}.gbff",
                 f"{CDN_BASE}/{acc_base}.gbff.gz", f"{CDN_BASE}/{accession}.gbff.gz"]:
         try:
-            r = requests.get(url, headers=HEADERS, timeout=(10, 20))
+            r = requests.get(url, headers=HEADERS, timeout=60)
             if r.ok:
                 raw = r.content
                 content = gzip.decompress(raw).decode("utf-8", errors="replace") \
@@ -149,40 +123,18 @@ def _download_annotation(accession: str) -> tuple[str | None, str]:
             continue
 
     # 2. NCBI GFF
-    try:
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FT
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            gff_url = ex.submit(_find_ncbi_gff_url, accession).result(timeout=45)
-    except Exception:
-        gff_url = None
+    gff_url = _find_ncbi_gff_url(accession)
     if gff_url:
         try:
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-            def _download_gff():
-                chunks = []
-                with requests.get(gff_url, headers=HEADERS, timeout=(10, 90), stream=True) as r:
-                    r.raise_for_status()
-                    size = 0
-                    for chunk in r.iter_content(chunk_size=65536):
-                        chunks.append(chunk)
-                        size += len(chunk)
-                        if size > 80 * 1024 * 1024:
-                            raise Exception("Dosya çok büyük (>80MB)")
-                return b"".join(chunks)
-            with ThreadPoolExecutor(max_workers=1) as ex:
-                future = ex.submit(_download_gff)
-                try:
-                    raw = future.result(timeout=25)
-                except FuturesTimeout:
-                    future.cancel()
-                    raise Exception("GFF indirme timeout (25s)")
+            r = requests.get(gff_url, headers=HEADERS, timeout=180)
+            raw = r.content
             content = gzip.decompress(raw).decode("utf-8", errors="replace") \
                       if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
             cache_set(accession, content)
             print(f"[GFF] {accession} indirildi ({len(content)} chars)")
             return content, "NCBI GFF annotation"
         except Exception as e:
-            print(f"[WARN] GFF indirme hatasi ({accession}): {e}")
+            print(f"[WARN] GFF indirme hatasi: {e}")
 
     return None, "indirilemedi"
 
@@ -191,17 +143,17 @@ def _find_ncbi_gff_url(accession: str) -> str | None:
     try:
         es = requests.get(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
-            params={"db": "assembly", "term": acc_base, "retmode": "json"}, timeout=(8, 15))
+            params={"db": "assembly", "term": acc_base, "retmode": "json"}, timeout=15)
         ids = es.json().get("esearchresult", {}).get("idlist", [])
         if ids:
             esummary = requests.get(
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
-                params={"db": "assembly", "id": ids[0], "retmode": "json"}, timeout=(8, 15))
+                params={"db": "assembly", "id": ids[0], "retmode": "json"}, timeout=15)
             doc = esummary.json().get("result", {}).get(ids[0], {})
             ftp = doc.get("ftppath_refseq") or doc.get("ftppath_genbank")
             if ftp:
                 ftp = ftp.replace("ftp://", "https://")
-                r = requests.get(ftp + "/", timeout=(8, 15))
+                r = requests.get(ftp + "/", timeout=15)
                 files = re.findall(r'href="([^"]+genomic\.gff\.gz)"', r.text)
                 if files:
                     fname = files[0]
@@ -214,7 +166,7 @@ def _find_ncbi_gff_url(accession: str) -> str | None:
         for prefix in ["GCF", "GCA"]:
             ftp_base = f"https://ftp.ncbi.nlm.nih.gov/genomes/all/{prefix}/{d1}/{d2}/{d3}/"
             try:
-                r = requests.get(ftp_base, timeout=(8, 15))
+                r = requests.get(ftp_base, timeout=15)
                 if not r.ok:
                     continue
                 folders = re.findall(r'href="([^"\']+/)"', r.text)
@@ -222,7 +174,7 @@ def _find_ncbi_gff_url(accession: str) -> str | None:
                     folder = folder.strip("/")
                     if acc_base in folder:
                         folder_url = ftp_base + folder + "/"
-                        r2 = requests.get(folder_url, timeout=(8, 15))
+                        r2 = requests.get(folder_url, timeout=15)
                         files = re.findall(r'href="([^"\']+genomic\.gff\.gz)"', r2.text)
                         if files:
                             fname = files[0]
@@ -357,7 +309,7 @@ def fetch_protein_sequence(protein_id: str) -> str | None:
         r = requests.get(
             "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
             params={"db": "protein", "id": protein_id, "rettype": "fasta", "retmode": "text"},
-            timeout=(8, 15))
+            timeout=15)
         if r.ok and r.text.startswith(">"):
             return r.text.strip()
     except Exception as e:
@@ -374,7 +326,7 @@ def fetch_gbff_features(accession, product_query):
     return matches, None
 
 def search_ncbi_gff(gff_url, product_query):
-    r = requests.get(gff_url, headers=HEADERS, timeout=(10, 30))
+    r = requests.get(gff_url, headers=HEADERS, timeout=180)
     raw = r.content
     content = gzip.decompress(raw).decode("utf-8", errors="replace") \
               if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
@@ -433,7 +385,7 @@ def search_product():
     if not accession:
         try:
             r = requests.get(f"https://api.bacdive.dsmz.de/strain/{bid}",
-                             headers={"Accept": "application/json"}, timeout=(8, 15))
+                             headers={"Accept": "application/json"}, timeout=15)
             if r.ok:
                 accession = find_accession(r.json())
         except Exception:
@@ -512,59 +464,21 @@ def sse_event(data: dict) -> str:
     return f"data: {payload}{padding}\n\n"
 
 
-def _worker(accession, product_queries, result_queue):
-    """Ayrı process'te çalışır."""
-    try:
-        content, source = _download_annotation(accession)
-        if content is None:
-            result_queue.put(("skip", None, None))
-        else:
-            matches = _parse_content(content, source, product_queries)
-            result_queue.put(("ok", matches, source))
-    except Exception as e:
-        result_queue.put(("error", str(e), None))
-
-
 def _scan_single(h, accession, product_queries, org_label):
-    """Tek bir strain'i tara — ayrı process ile 90s hard timeout."""
-    from multiprocessing import Process, Queue
-
+    """Tek bir strain'i tara — ThreadPoolExecutor'dan çağrılır."""
     strain_name = h["name"]
     bid         = h["id"]
 
-    q = Queue()
-    p = Process(target=_worker, args=(accession, product_queries, q))
-    p.start()
-    p.join(timeout=90)
-
-    if p.is_alive():
-        p.kill()
-        p.join()
-        print(f"[TIMEOUT] {strain_name} ({accession}) 90s aşıldı")
+    content, source = _download_annotation(accession)
+    if content is None:
         return {"status": "skip", "strain_name": strain_name,
-                "accession": accession, "bacdive_id": bid,
-                "reason": "Timeout (90s)", "organism": org_label}
+                "accession": accession, "bacdive_id": bid, "reason": "Annotation indirilemedi"}
 
-    if q.empty():
-        return {"status": "skip", "strain_name": strain_name,
-                "accession": accession, "bacdive_id": bid,
-                "reason": "Sonuç alınamadı", "organism": org_label}
+    matches = _parse_content(content, source, product_queries)
 
-    status, data, source = q.get()
-
-    if status == "skip":
-        return {"status": "skip", "strain_name": strain_name,
-                "accession": accession, "bacdive_id": bid,
-                "reason": "Annotation indirilemedi", "organism": org_label}
-    if status == "error":
-        return {"status": "skip", "strain_name": strain_name,
-                "accession": accession, "bacdive_id": bid,
-                "reason": data, "organism": org_label}
-
-    matches = data
     if not matches:
         return {"status": "not_found", "strain_name": strain_name,
-                "accession": accession, "bacdive_id": bid, "organism": org_label}
+                "accession": accession, "bacdive_id": bid}
 
     return {
         "status":      "found",
@@ -577,9 +491,6 @@ def _scan_single(h, accession, product_queries, org_label):
         "results":     matches,
         "organism":    org_label,
     }
-
-
-
 
 
 @app.route("/scan-organism", methods=["GET"])
@@ -632,11 +543,9 @@ def scan_organism():
                 "total_strains": len(hits), "with_assembly": len(with_asm), "no_assembly": len(no_asm),
             })
 
-            # Assembly'si olmayanları direkt atla
             for h in no_asm:
                 yield sse_event({"type": "skip", "organism": org,
-                                 "strain_name": h["name"], "bacdive_id": h["id"],
-                                 "reason": "Assembly yok"})
+                                 "strain_name": h["name"], "bacdive_id": h["id"], "reason": "Assembly yok"})
 
             all_pairs.extend([(h, acc, org) for h, acc in with_asm])
 
