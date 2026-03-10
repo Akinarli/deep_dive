@@ -35,34 +35,27 @@ def _cache_path(accession: str) -> str:
     return os.path.join(CACHE_DIR, f"{key}.pkl")
 
 def cache_get(accession: str):
-    with _cache_lock:
-        # Önce memory
-        entry = _annotation_cache.get(accession)
-        if entry and (time.time() - entry["ts"]) < CACHE_TTL:
-            return entry["content"]
-        # Sonra disk
-        path = _cache_path(accession)
-        if os.path.exists(path):
-            try:
-                with open(path, "rb") as f:
-                    entry = pickle.load(f)
-                if (time.time() - entry["ts"]) < CACHE_TTL:
-                    _annotation_cache[accession] = entry
-                    return entry["content"]
-            except Exception:
-                pass
-        return None
-
-def cache_set(accession: str, content: str):
-    with _cache_lock:
-        entry = {"content": content, "ts": time.time()}
-        _annotation_cache[accession] = entry
+    # Sadece disk cache - memory cache RAM'i tüketiyor
+    path = _cache_path(accession)
+    if os.path.exists(path):
         try:
-            path = _cache_path(accession)
-            with open(path, "wb") as f:
-                pickle.dump(entry, f)
+            with open(path, "rb") as f:
+                entry = pickle.load(f)
+            if (time.time() - entry["ts"]) < CACHE_TTL:
+                return entry["content"]
         except Exception:
             pass
+    return None
+
+def cache_set(accession: str, content: str):
+    # Sadece diske yaz
+    try:
+        entry = {"content": content, "ts": time.time()}
+        path = _cache_path(accession)
+        with open(path, "wb") as f:
+            pickle.dump(entry, f)
+    except Exception:
+        pass
 
 # ─── BacDive ──────────────────────────────────────────────────────────────────
 
