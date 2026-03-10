@@ -123,26 +123,40 @@ def _download_annotation(accession: str) -> tuple[str | None, str]:
             continue
 
     # 2. NCBI GFF
-    gff_url = _find_ncbi_gff_url(accession)
+    try:
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FT
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            gff_url = ex.submit(_find_ncbi_gff_url, accession).result(timeout=45)
+    except Exception:
+        gff_url = None
     if gff_url:
         try:
-            raw_chunks = []
-            with requests.get(gff_url, headers=HEADERS, timeout=(8, 15), stream=True) as r:
-                r.raise_for_status()
-                size = 0
-                for chunk in r.iter_content(chunk_size=65536):
-                    raw_chunks.append(chunk)
-                    size += len(chunk)
-                    if size > 150 * 1024 * 1024:  # 150MB limit
-                        raise Exception("Dosya çok büyük (>150MB)")
-            raw = b"".join(raw_chunks)
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+            def _download_gff():
+                chunks = []
+                with requests.get(gff_url, headers=HEADERS, timeout=(10, 90), stream=True) as r:
+                    r.raise_for_status()
+                    size = 0
+                    for chunk in r.iter_content(chunk_size=65536):
+                        chunks.append(chunk)
+                        size += len(chunk)
+                        if size > 80 * 1024 * 1024:
+                            raise Exception("Dosya çok büyük (>80MB)")
+                return b"".join(chunks)
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(_download_gff)
+                try:
+                    raw = future.result(timeout=25)
+                except FuturesTimeout:
+                    future.cancel()
+                    raise Exception("GFF indirme timeout (25s)")
             content = gzip.decompress(raw).decode("utf-8", errors="replace") \
                       if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
             cache_set(accession, content)
             print(f"[GFF] {accession} indirildi ({len(content)} chars)")
             return content, "NCBI GFF annotation"
         except Exception as e:
-            print(f"[WARN] GFF indirme hatasi: {e}")
+            print(f"[WARN] GFF indirme hatasi ({accession}): {e}")
 
     return None, "indirilemedi"
 
