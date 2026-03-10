@@ -493,11 +493,11 @@ function ScanMode2({ t, addHistory }) {
       if (data.type === "organism_summary") setSummary(s => ({ ...(s||{}), [data.organism]: data }));
       else if (data.type === "scan_start") setProgress({ current:0, total: data.total });
       else if (data.type === "scanning") {
-        setProgress(p => ({...p, current: data.progress}));
-        // Sadece aktif taranan item'ı göster — önceki "scanning" olanı kaldır, yenisini ekle
+        setProgress(p => ({...p, current: data.progress, total: data.total||p.total}));
         setItems(prev => {
-          const withoutScanning = prev.filter(i => i.status !== "scanning");
-          return [...withoutScanning, {
+          // Önceki "scanning" olanı kaldır, yeni scanning'i en alta ekle
+          const rest = prev.filter(i => i.status !== "scanning");
+          return [...rest, {
             id: `s_${data.bacdive_id}`, status: "scanning",
             strain_name: data.strain_name, accession: data.accession,
             bacdive_id: data.bacdive_id, organism: data.organism
