@@ -265,7 +265,7 @@ async def find_ncbi_gff_url_async(session, accession):
     return None
 
 async def download_annotation_async(session, accession):
-    """Cache → DSMZ CDN GBFF → NCBI GFF sırasıyla dene."""
+    """Cache → DSMZ CDN GBFF → NCBI GFF (max 50MB, 30s) sırasıyla dene."""
     cached = cache_get(accession)
     if cached:
         print(f"[CACHE] {accession}")
@@ -282,14 +282,32 @@ async def download_annotation_async(session, accession):
             print(f"[GBFF] {accession}")
             return content, "BacDive Bakta annotation"
 
-    # 2. NCBI GFF
+    # 2. NCBI GFF — max 50MB, 30s hard timeout
     gff_url = await find_ncbi_gff_url_async(session, accession)
     if gff_url:
-        content = await fetch_url_async(session, gff_url, timeout=60)
-        if content:
-            cache_set(accession, (content, "NCBI GFF annotation"))
-            print(f"[GFF] {accession}")
-            return content, "NCBI GFF annotation"
+        try:
+            async with session.get(
+                gff_url, headers=HEADERS,
+                timeout=aiohttp.ClientTimeout(total=30, connect=10)
+            ) as r:
+                if r.status == 200:
+                    MAX_BYTES = 50 * 1024 * 1024
+                    chunks = []
+                    total_bytes = 0
+                    async for chunk in r.content.iter_chunked(65536):
+                        chunks.append(chunk)
+                        total_bytes += len(chunk)
+                        if total_bytes > MAX_BYTES:
+                            print(f"[WARN] GFF too large: {accession}")
+                            break
+                    raw = b"".join(chunks)
+                    text = gzip.decompress(raw).decode("utf-8", errors="replace") \
+                           if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
+                    cache_set(accession, (text, "NCBI GFF annotation"))
+                    print(f"[GFF] {accession} ({total_bytes//1024}KB)")
+                    return text, "NCBI GFF annotation"
+        except Exception as e:
+            print(f"[WARN] GFF error {accession}: {e}")
 
     return None, None
 
@@ -565,7 +583,17 @@ async def scan_all_async(organisms, product_queries, queue):
                     "total":       total,
                 }))
 
-                content, source = await download_annotation_async(session, accession)
+                try:
+                    content, source = await asyncio.wait_for(
+                        download_annotation_async(session, accession), timeout=45
+                    )
+                except asyncio.TimeoutError:
+                    await queue.put(sse_event({
+                        "type": "skip", "organism": org,
+                        "strain_name": strain_name, "accession": accession,
+                        "bacdive_id": bid, "reason": "Timeout (45s)",
+                    }))
+                    return
 
                 if content is None:
                     await queue.put(sse_event({
@@ -598,9 +626,9 @@ async def scan_all_async(organisms, product_queries, queue):
                     "results":     matches,
                 }))
 
-            # Hepsini aynı anda başlat
-            tasks = [scan_one(h, acc, idx) for idx, (h, acc) in enumerate(with_asm)]
-            await asyncio.gather(*tasks)
+            # Sırayla tara — her strain biter bitmez SSE'ye düşer
+            for idx, (h, acc) in enumerate(with_asm):
+                await scan_one(h, acc, idx)
 
             await queue.put(sse_event({
                 "type":          "done",
