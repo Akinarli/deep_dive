@@ -545,7 +545,9 @@ def scan_organism():
 
             # Assembly'si olmayan strainler için NCBI fallback dene
             for h in no_asm:
+                print(f"[NCBI FALLBACK] {h['name']} aranıyor...")
                 acc = find_accession_via_ncbi(h["name"])
+                print(f"[NCBI FALLBACK] {h['name']} -> {acc}")
                 if acc:
                     with_asm.append((h, acc))
                 else:
