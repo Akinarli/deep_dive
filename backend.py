@@ -126,8 +126,16 @@ def _download_annotation(accession: str) -> tuple[str | None, str]:
     gff_url = _find_ncbi_gff_url(accession)
     if gff_url:
         try:
-            r = requests.get(gff_url, headers=HEADERS, timeout=(10, 30))
-            raw = r.content
+            raw_chunks = []
+            with requests.get(gff_url, headers=HEADERS, timeout=(10, 20), stream=True) as r:
+                r.raise_for_status()
+                size = 0
+                for chunk in r.iter_content(chunk_size=65536):
+                    raw_chunks.append(chunk)
+                    size += len(chunk)
+                    if size > 150 * 1024 * 1024:  # 150MB limit
+                        raise Exception("Dosya çok büyük (>150MB)")
+            raw = b"".join(raw_chunks)
             content = gzip.decompress(raw).decode("utf-8", errors="replace") \
                       if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
             cache_set(accession, content)
