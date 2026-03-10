@@ -543,9 +543,15 @@ def scan_organism():
                 "total_strains": len(hits), "with_assembly": len(with_asm), "no_assembly": len(no_asm),
             })
 
+            # Assembly'si olmayan strainler için NCBI fallback dene
             for h in no_asm:
-                yield sse_event({"type": "skip", "organism": org,
-                                 "strain_name": h["name"], "bacdive_id": h["id"], "reason": "Assembly yok"})
+                acc = find_accession_via_ncbi(h["name"])
+                if acc:
+                    with_asm.append((h, acc))
+                else:
+                    yield sse_event({"type": "skip", "organism": org,
+                                     "strain_name": h["name"], "bacdive_id": h["id"],
+                                     "reason": "Assembly yok (BacDive + NCBI)"})
 
             all_pairs.extend([(h, acc, org) for h, acc in with_asm])
 
