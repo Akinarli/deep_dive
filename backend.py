@@ -127,7 +127,7 @@ def _download_annotation(accession: str) -> tuple[str | None, str]:
     if gff_url:
         try:
             raw_chunks = []
-            with requests.get(gff_url, headers=HEADERS, timeout=(10, 20), stream=True) as r:
+            with requests.get(gff_url, headers=HEADERS, timeout=(8, 15), stream=True) as r:
                 r.raise_for_status()
                 size = 0
                 for chunk in r.iter_content(chunk_size=65536):
@@ -565,17 +565,11 @@ def scan_organism():
                 "total_strains": len(hits), "with_assembly": len(with_asm), "no_assembly": len(no_asm),
             })
 
-            # Assembly'si olmayan strainler için NCBI fallback dene
+            # Assembly'si olmayanları direkt atla
             for h in no_asm:
-                print(f"[NCBI FALLBACK] {h['name']} aranıyor...")
-                acc = find_accession_via_ncbi(h["name"])
-                print(f"[NCBI FALLBACK] {h['name']} -> {acc}")
-                if acc:
-                    with_asm.append((h, acc))
-                else:
-                    yield sse_event({"type": "skip", "organism": org,
-                                     "strain_name": h["name"], "bacdive_id": h["id"],
-                                     "reason": "Assembly yok (BacDive + NCBI)"})
+                yield sse_event({"type": "skip", "organism": org,
+                                 "strain_name": h["name"], "bacdive_id": h["id"],
+                                 "reason": "Assembly yok"})
 
             all_pairs.extend([(h, acc, org) for h, acc in with_asm])
 
