@@ -512,53 +512,71 @@ def sse_event(data: dict) -> str:
     return f"data: {payload}{padding}\n\n"
 
 
+def _worker(accession, product_queries, result_queue):
+    """Ayrı process'te çalışır."""
+    try:
+        content, source = _download_annotation(accession)
+        if content is None:
+            result_queue.put(("skip", None, None))
+        else:
+            matches = _parse_content(content, source, product_queries)
+            result_queue.put(("ok", matches, source))
+    except Exception as e:
+        result_queue.put(("error", str(e), None))
+
+
 def _scan_single(h, accession, product_queries, org_label):
-    """Tek bir strain'i tara — signal ile 90s hard timeout."""
-    import signal
+    """Tek bir strain'i tara — ayrı process ile 90s hard timeout."""
+    from multiprocessing import Process, Queue
 
     strain_name = h["name"]
     bid         = h["id"]
 
-    def _timeout_handler(signum, frame):
-        raise TimeoutError(f"90s aşıldı: {strain_name}")
+    q = Queue()
+    p = Process(target=_worker, args=(accession, product_queries, q))
+    p.start()
+    p.join(timeout=90)
 
-    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(90)
-    try:
-        content, source = _download_annotation(accession)
-        signal.alarm(0)
-        if content is None:
-            return {"status": "skip", "strain_name": strain_name,
-                    "accession": accession, "bacdive_id": bid,
-                    "reason": "Annotation indirilemedi", "organism": org_label}
-        matches = _parse_content(content, source, product_queries)
-        if not matches:
-            return {"status": "not_found", "strain_name": strain_name,
-                    "accession": accession, "bacdive_id": bid, "organism": org_label}
-        return {
-            "status":      "found",
-            "strain_name": strain_name,
-            "accession":   accession,
-            "bacdive_id":  bid,
-            "bacdive_url": f"{BACDIVE_WEB}/{bid}",
-            "source":      source,
-            "match_count": len(matches),
-            "results":     matches,
-            "organism":    org_label,
-        }
-    except TimeoutError:
-        signal.alarm(0)
-        print(f"[TIMEOUT] {strain_name} ({accession}) 90s aşıldı, atlanıyor")
+    if p.is_alive():
+        p.kill()
+        p.join()
+        print(f"[TIMEOUT] {strain_name} ({accession}) 90s aşıldı")
         return {"status": "skip", "strain_name": strain_name,
                 "accession": accession, "bacdive_id": bid,
                 "reason": "Timeout (90s)", "organism": org_label}
-    except Exception as e:
-        signal.alarm(0)
+
+    if q.empty():
         return {"status": "skip", "strain_name": strain_name,
                 "accession": accession, "bacdive_id": bid,
-                "reason": str(e), "organism": org_label}
-    finally:
-        signal.signal(signal.SIGALRM, old_handler)
+                "reason": "Sonuç alınamadı", "organism": org_label}
+
+    status, data, source = q.get()
+
+    if status == "skip":
+        return {"status": "skip", "strain_name": strain_name,
+                "accession": accession, "bacdive_id": bid,
+                "reason": "Annotation indirilemedi", "organism": org_label}
+    if status == "error":
+        return {"status": "skip", "strain_name": strain_name,
+                "accession": accession, "bacdive_id": bid,
+                "reason": data, "organism": org_label}
+
+    matches = data
+    if not matches:
+        return {"status": "not_found", "strain_name": strain_name,
+                "accession": accession, "bacdive_id": bid, "organism": org_label}
+
+    return {
+        "status":      "found",
+        "strain_name": strain_name,
+        "accession":   accession,
+        "bacdive_id":  bid,
+        "bacdive_url": f"{BACDIVE_WEB}/{bid}",
+        "source":      source,
+        "match_count": len(matches),
+        "results":     matches,
+        "organism":    org_label,
+    }
 
 
 
