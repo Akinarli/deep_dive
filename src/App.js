@@ -493,30 +493,36 @@ function ScanMode2({ t, addHistory }) {
       if (data.type === "organism_summary") setSummary(s => ({ ...(s||{}), [data.organism]: data }));
       else if (data.type === "scan_start") setProgress({ current:0, total: data.total });
       else if (data.type === "scanning") {
+        // Aktif taranan — eski scanning'i sil, yenisini ekle
         setProgress(p => ({...p, current: data.progress, total: data.total||p.total}));
-        setItems(prev => {
-          // Önceki "scanning" olanı kaldır, yeni scanning'i en alta ekle
-          const rest = prev.filter(i => i.status !== "scanning");
-          return [...rest, {
-            id: `s_${data.bacdive_id}`, status: "scanning",
-            strain_name: data.strain_name, accession: data.accession,
-            bacdive_id: data.bacdive_id, organism: data.organism
-          }];
-        });
+        setItems(prev => [
+          ...prev.filter(i => i.status !== "scanning"),
+          { id:`s_${data.bacdive_id}`, status:"scanning",
+            strain_name:data.strain_name, accession:data.accession,
+            bacdive_id:data.bacdive_id, organism:data.organism }
+        ]);
         setTimeout(() => bottomRef.current?.scrollIntoView({behavior:"smooth"}), 50);
       }
       else if (data.type === "found") {
         setProgress(p => ({...p, current: data.progress||p.current}));
-        setItems(prev => prev.map(i => i.id===`s_${data.bacdive_id}` ? {...i, status:"found",...data} : i));
+        // scanning kartını found ile değiştir
+        setItems(prev => prev.map(i =>
+          i.id===`s_${data.bacdive_id}` ? {...data, id:`s_${data.bacdive_id}`, status:"found"} : i
+        ));
+        setTimeout(() => bottomRef.current?.scrollIntoView({behavior:"smooth"}), 50);
       }
       else if (data.type === "not_found") {
-        setItems(prev => prev.map(i => i.id===`s_${data.bacdive_id}` ? {...i, status:"notfound"} : i));
+        setProgress(p => ({...p, current: data.progress||p.current}));
+        setItems(prev => prev.map(i =>
+          i.id===`s_${data.bacdive_id}` ? {...i, status:"notfound"} : i
+        ));
       }
       else if (data.type === "skip") {
+        const upd = { id:`s_${data.bacdive_id}`, status:"skip",
+          strain_name:data.strain_name, accession:data.accession,
+          bacdive_id:data.bacdive_id, reason:data.reason, organism:data.organism };
         setItems(prev => {
           const ex = prev.find(i => i.id===`s_${data.bacdive_id}`);
-          const upd = { id:`s_${data.bacdive_id}`, status:"skip", strain_name:data.strain_name,
-            accession:data.accession, bacdive_id:data.bacdive_id, reason:data.reason, organism:data.organism };
           return ex ? prev.map(i => i.id===`s_${data.bacdive_id}` ? upd : i) : [...prev, upd];
         });
       }
