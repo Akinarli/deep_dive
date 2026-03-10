@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import * as XLSX from "https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs";
 
 const API_BASE = "https://deepdive-backend-6nza.onrender.com";
 
@@ -471,6 +472,60 @@ function ScanMode2({ t, addHistory }) {
     setScanning(false); setItems([]); setProgress({ current: 0, total: 0 }); setDone(null);
   }
 
+  function exportExcel(items, orgTags, prodTags) {
+    const wb = XLSX.utils.book_new();
+
+    // Sayfa 1: Bulunan genler (detaylı)
+    const foundItems = items.filter(i => i.status === "found");
+    const detailRows = [["Organizma", "Strain", "BacDive ID", "Assembly", "Kaynak",
+      "Locus Tag", "Contig", "Start", "Stop", "Strand", "Type", "Gene", "Product", "Protein ID"]];
+
+    foundItems.forEach(item => {
+      (item.results || []).forEach(r => {
+        detailRows.push([
+          item.organism || "", item.strain_name, item.bacdive_id, item.accession,
+          item.source || "",
+          r.locus_tag, r.contig, r.start, r.stop, r.strand, r.type,
+          r.gene || "", r.product, r.protein_id || ""
+        ]);
+      });
+    });
+
+    const ws1 = XLSX.utils.aoa_to_sheet(detailRows);
+    // Sütun genişlikleri
+    ws1["!cols"] = [14,22,10,14,20,18,16,10,10,7,8,10,40,18].map(w => ({wch:w}));
+    // Header stil
+    const headerRange = XLSX.utils.decode_range(ws1["!ref"]);
+    for (let c = headerRange.s.c; c <= headerRange.e.c; c++) {
+      const cell = ws1[XLSX.utils.encode_cell({r:0, c})];
+      if (cell) cell.s = { font:{bold:true}, fill:{fgColor:{rgb:"1a2e1a"}}, alignment:{horizontal:"center"} };
+    }
+    XLSX.utils.book_append_sheet(wb, ws1, "Bulunan Genler");
+
+    // Sayfa 2: Özet — tüm strainler
+    const summaryRows = [["Organizma", "Strain", "BacDive ID", "Assembly", "Durum", "Eşleşme Sayısı", "Kaynak", "Sebep"]];
+    items.forEach(item => {
+      summaryRows.push([
+        item.organism || "", item.strain_name, item.bacdive_id || "",
+        item.accession || "",
+        item.status === "found" ? "Bulundu" : item.status === "notfound" ? "Yok" : "Atlandı",
+        item.match_count || 0,
+        item.source || "",
+        item.reason || ""
+      ]);
+    });
+
+    const ws2 = XLSX.utils.aoa_to_sheet(summaryRows);
+    ws2["!cols"] = [14,22,10,14,10,14,20,20].map(w => ({wch:w}));
+    XLSX.utils.book_append_sheet(wb, ws2, "Özet");
+
+    // Dosya adı
+    const org = orgTags.join("-").slice(0,20);
+    const prod = prodTags.join("-").slice(0,20);
+    const date = new Date().toISOString().slice(0,10);
+    XLSX.writeFile(wb, \`DeepDive_\${org}_\${prod}_\${date}.xlsx\`);
+  }
+
   function startScan() {
     if (!orgTags.length || !prodTags.length) return;
     reset();
@@ -578,6 +633,12 @@ function ScanMode2({ t, addHistory }) {
           </button>
           {items.length > 0 && !scanning && (
             <button className="btn btn-ghost" onClick={reset}>Temizle</button>
+          )}
+          {items.filter(i => i.status === "found").length > 0 && !scanning && (
+            <button className="btn btn-ghost" onClick={() => exportExcel(items, orgTags, prodTags)}
+              style={{color:"#22c55e",borderColor:"#22c55e"}}>
+              ⬇ Excel
+            </button>
           )}
         </div>
       </div>
