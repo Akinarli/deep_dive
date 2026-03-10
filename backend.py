@@ -506,9 +506,9 @@ def protein_sequence():
 # ─── MOD 2: Paralel cins tarama (SSE) ────────────────────────────────────────
 
 def sse_event(data: dict) -> str:
-    # Render proxy buffer'ını kırmak için padding (en az 1KB)
+    # Render proxy buffer'ını kırmak için padding (4KB)
     payload = json.dumps(data, ensure_ascii=False)
-    padding = " " * max(0, 1024 - len(payload))
+    padding = " " * max(0, 4096 - len(payload))
     return f"data: {payload}{padding}\n\n"
 
 
