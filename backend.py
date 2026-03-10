@@ -265,7 +265,7 @@ async def find_ncbi_gff_url_async(session, accession):
     return None
 
 async def download_annotation_async(session, accession):
-    """Cache → DSMZ CDN GBFF → NCBI GFF (max 50MB, 30s) sırasıyla dene."""
+    """Cache → DSMZ CDN GBFF → NCBI GFF sırasıyla dene."""
     cached = cache_get(accession)
     if cached:
         print(f"[CACHE] {accession}")
@@ -282,32 +282,14 @@ async def download_annotation_async(session, accession):
             print(f"[GBFF] {accession}")
             return content, "BacDive Bakta annotation"
 
-    # 2. NCBI GFF — max 50MB, 30s hard timeout
+    # 2. NCBI GFF
     gff_url = await find_ncbi_gff_url_async(session, accession)
     if gff_url:
-        try:
-            async with session.get(
-                gff_url, headers=HEADERS,
-                timeout=aiohttp.ClientTimeout(total=30, connect=10)
-            ) as r:
-                if r.status == 200:
-                    MAX_BYTES = 50 * 1024 * 1024
-                    chunks = []
-                    total_bytes = 0
-                    async for chunk in r.content.iter_chunked(65536):
-                        chunks.append(chunk)
-                        total_bytes += len(chunk)
-                        if total_bytes > MAX_BYTES:
-                            print(f"[WARN] GFF too large: {accession}")
-                            break
-                    raw = b"".join(chunks)
-                    text = gzip.decompress(raw).decode("utf-8", errors="replace") \
-                           if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
-                    cache_set(accession, (text, "NCBI GFF annotation"))
-                    print(f"[GFF] {accession} ({total_bytes//1024}KB)")
-                    return text, "NCBI GFF annotation"
-        except Exception as e:
-            print(f"[WARN] GFF error {accession}: {e}")
+        content = await fetch_url_async(session, gff_url, timeout=60)
+        if content:
+            cache_set(accession, (content, "NCBI GFF annotation"))
+            print(f"[GFF] {accession}")
+            return content, "NCBI GFF annotation"
 
     return None, None
 
@@ -449,50 +431,25 @@ def search_product():
                         "message": "Genome assembly bulunamadi."})
 
     product_queries = [p.strip() for p in product_q.split(",") if p.strip()]
-
-    # Annotation'ı indir (cache'den veya CDN/NCBI'dan)
-    content = None
-    source  = None
-
-    acc_base = accession.split(".")[0]
-    for url in [f"{CDN_BASE}/{acc_base}.gbff", f"{CDN_BASE}/{accession}.gbff",
-                f"{CDN_BASE}/{acc_base}.gbff.gz", f"{CDN_BASE}/{accession}.gbff.gz"]:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=40)
-            if r.ok:
-                raw = r.content
-                content = gzip.decompress(raw).decode("utf-8", errors="replace") \
-                          if url.endswith(".gz") else raw.decode("utf-8", errors="replace")
-                source = "BacDive Bakta annotation"
-                break
-        except Exception:
-            continue
-
-    if content is None:
+    matches, err = fetch_gbff_features(accession, product_queries[0] if len(product_queries)==1 else product_q)
+    if matches is None:
         gff_url = find_ncbi_gff(accession)
         if not gff_url:
             return jsonify({"found": False, "error_code": "NO_GFF_URL",
                             "message": f"Annotation indirilemedi. Accession: {accession}",
                             "accession": accession})
         try:
-            r = requests.get(gff_url, headers=HEADERS, timeout=60)
-            raw = r.content
-            content = gzip.decompress(raw).decode("utf-8", errors="replace") \
-                      if gff_url.endswith(".gz") else raw.decode("utf-8", errors="replace")
-            source = "NCBI GFF annotation"
+            matches = search_ncbi_gff(gff_url, product_q)
         except Exception as e:
             return jsonify({"found": False, "error_code": "DOWNLOAD_ERROR",
                             "message": str(e), "accession": accession})
-
-    # Multi-keyword parse
-    matches = parse_content(content, product_queries)
 
     if not matches:
         return jsonify({"found": False, "error_code": "NO_PRODUCT",
                         "message": f"'{product_q}' bulunamadi.", "accession": accession})
     return jsonify({"found": True, "accession": accession, "bacdive_id": bid,
                     "product_query": product_q, "total": len(matches),
-                    "source": source, "results": matches})
+                    "source": "annotation", "results": matches})
 
 
 @app.route("/protein-sequence", methods=["POST"])
@@ -583,17 +540,7 @@ async def scan_all_async(organisms, product_queries, queue):
                     "total":       total,
                 }))
 
-                try:
-                    content, source = await asyncio.wait_for(
-                        download_annotation_async(session, accession), timeout=45
-                    )
-                except asyncio.TimeoutError:
-                    await queue.put(sse_event({
-                        "type": "skip", "organism": org,
-                        "strain_name": strain_name, "accession": accession,
-                        "bacdive_id": bid, "reason": "Timeout (45s)",
-                    }))
-                    return
+                content, source = await download_annotation_async(session, accession)
 
                 if content is None:
                     await queue.put(sse_event({
@@ -626,9 +573,9 @@ async def scan_all_async(organisms, product_queries, queue):
                     "results":     matches,
                 }))
 
-            # Sırayla tara — her strain biter bitmez SSE'ye düşer
-            for idx, (h, acc) in enumerate(with_asm):
-                await scan_one(h, acc, idx)
+            # Hepsini aynı anda başlat
+            tasks = [scan_one(h, acc, idx) for idx, (h, acc) in enumerate(with_asm)]
+            await asyncio.gather(*tasks)
 
             await queue.put(sse_event({
                 "type":          "done",
