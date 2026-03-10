@@ -1,5 +1,4 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import * as XLSX from "xlsx";
 
 const API_BASE = "https://deepdive-backend-6nza.onrender.com";
 
@@ -473,59 +472,75 @@ function ScanMode2({ t, addHistory }) {
   }
 
   function exportExcel(items, orgTags, prodTags) {
+    const XLSX = window.XLSX;
+    if (!XLSX) { alert("Excel kütüphanesi yükleniyor, lütfen bekleyin..."); return; }
+
     const wb = XLSX.utils.book_new();
+    const GREEN_HDR = { font: { bold: true, color: { rgb: "FFFFFF" } }, fill: { fgColor: { rgb: "1B5E20" } }, alignment: { horizontal: "center", vertical: "center", wrapText: true }, border: { bottom: { style: "thin", color: { rgb: "4CAF50" } } } };
+    const FOUND_ROW = { fill: { fgColor: { rgb: "0D2B0D" } } };
+    const NOTFOUND_ROW = { fill: { fgColor: { rgb: "1A1A00" } } };
+    const SKIP_ROW = { fill: { fgColor: { rgb: "1A1A1A" } } };
 
-    // Sayfa 1: Bulunan genler (detaylı)
-    const foundItems = items.filter(i => i.status === "found");
-    const detailRows = [["Organizma", "Strain", "BacDive ID", "Assembly", "Kaynak",
-      "Locus Tag", "Contig", "Start", "Stop", "Strand", "Type", "Gene", "Product", "Protein ID"]];
-
-    foundItems.forEach(item => {
+    // ── Sayfa 1: Bulunan Genler ──
+    const hdrs1 = ["Organizma","Strain","BacDive ID","Assembly","Kaynak","Locus Tag","Contig","Start","Stop","Strand","Type","Gene","Product","Protein ID"];
+    const rows1 = [hdrs1];
+    items.filter(i => i.status === "found").forEach(item => {
       (item.results || []).forEach(r => {
-        detailRows.push([
-          item.organism || "", item.strain_name, item.bacdive_id, item.accession,
-          item.source || "",
-          r.locus_tag, r.contig, r.start, r.stop, r.strand, r.type,
-          r.gene || "", r.product, r.protein_id || ""
-        ]);
+        rows1.push([item.organism||"", item.strain_name, item.bacdive_id||"", item.accession||"",
+          item.source||"", r.locus_tag||"", r.contig||"", r.start||"", r.stop||"",
+          r.strand||"", r.type||"", r.gene||"", r.product||"", r.protein_id||""]);
       });
     });
-
-    const ws1 = XLSX.utils.aoa_to_sheet(detailRows);
-    // Sütun genişlikleri
-    ws1["!cols"] = [14,22,10,14,20,18,16,10,10,7,8,10,40,18].map(w => ({wch:w}));
+    const ws1 = XLSX.utils.aoa_to_sheet(rows1);
+    ws1["!cols"] = [14,24,10,14,22,18,16,9,9,7,6,8,42,18].map(w => ({ wch: w }));
+    ws1["!freeze"] = { xSplit: 0, ySplit: 1 };
     // Header stil
-    const headerRange = XLSX.utils.decode_range(ws1["!ref"]);
-    for (let c = headerRange.s.c; c <= headerRange.e.c; c++) {
-      const cell = ws1[XLSX.utils.encode_cell({r:0, c})];
-      if (cell) cell.s = { font:{bold:true}, fill:{fgColor:{rgb:"1a2e1a"}}, alignment:{horizontal:"center"} };
+    hdrs1.forEach((_, c) => {
+      const ref = XLSX.utils.encode_cell({ r: 0, c });
+      if (ws1[ref]) ws1[ref].s = GREEN_HDR;
+    });
+    // Satır rengi
+    for (let r = 1; r < rows1.length; r++) {
+      for (let c = 0; c < hdrs1.length; c++) {
+        const ref = XLSX.utils.encode_cell({ r, c });
+        if (!ws1[ref]) ws1[ref] = { t: "s", v: "" };
+        ws1[ref].s = { ...(ws1[ref].s||{}), fill: { fgColor: { rgb: r % 2 === 0 ? "0A1F0A" : "0D2B0D" } }, font: { color: { rgb: "CCFFCC" } } };
+      }
     }
     XLSX.utils.book_append_sheet(wb, ws1, "Bulunan Genler");
 
-    // Sayfa 2: Özet — tüm strainler
-    const summaryRows = [["Organizma", "Strain", "BacDive ID", "Assembly", "Durum", "Eşleşme Sayısı", "Kaynak", "Sebep"]];
+    // ── Sayfa 2: Özet ──
+    const hdrs2 = ["Organizma","Strain","BacDive ID","Assembly","Durum","Eşleşme","Kaynak","Sebep"];
+    const rows2 = [hdrs2];
     items.forEach(item => {
-      summaryRows.push([
-        item.organism || "", item.strain_name, item.bacdive_id || "",
-        item.accession || "",
-        item.status === "found" ? "Bulundu" : item.status === "notfound" ? "Yok" : "Atlandı",
-        item.match_count || 0,
-        item.source || "",
-        item.reason || ""
-      ]);
+      const durum = item.status==="found" ? "Bulundu" : item.status==="notfound" ? "Yok" : "Atlandı";
+      rows2.push([item.organism||"", item.strain_name, item.bacdive_id||"", item.accession||"",
+        durum, item.match_count||0, item.source||"", item.reason||""]);
     });
+    const ws2 = XLSX.utils.aoa_to_sheet(rows2);
+    ws2["!cols"] = [14,24,10,14,10,10,22,22].map(w => ({ wch: w }));
+    ws2["!freeze"] = { xSplit: 0, ySplit: 1 };
+    hdrs2.forEach((_, c) => {
+      const ref = XLSX.utils.encode_cell({ r: 0, c });
+      if (ws2[ref]) ws2[ref].s = GREEN_HDR;
+    });
+    for (let r = 1; r < rows2.length; r++) {
+      const status = rows2[r][4];
+      const style = status === "Bulundu" ? FOUND_ROW : status === "Yok" ? NOTFOUND_ROW : SKIP_ROW;
+      const txtColor = status === "Bulundu" ? "88FF88" : status === "Yok" ? "AAAAAA" : "555555";
+      for (let c = 0; c < hdrs2.length; c++) {
+        const ref = XLSX.utils.encode_cell({ r, c });
+        if (!ws2[ref]) ws2[ref] = { t: "s", v: "" };
+        ws2[ref].s = { fill: style.fill, font: { color: { rgb: txtColor } } };
+      }
+    }
+    XLSX.utils.book_append_sheet(wb, ws2, "Ozet");
 
-    const ws2 = XLSX.utils.aoa_to_sheet(summaryRows);
-    ws2["!cols"] = [14,22,10,14,10,14,20,20].map(w => ({wch:w}));
-    XLSX.utils.book_append_sheet(wb, ws2, "Özet");
-
-    // Dosya adı
-    const org = orgTags.join("-").slice(0,20);
-    const prod = prodTags.join("-").slice(0,20);
+    const org = orgTags.join("-").replace(/[^a-zA-Z0-9-]/g,"").slice(0,20);
+    const prod = prodTags.join("-").replace(/[^a-zA-Z0-9-]/g,"").slice(0,20);
     const date = new Date().toISOString().slice(0,10);
-    XLSX.writeFile(wb, \`DeepDive_\${org}_\${prod}_\${date}.xlsx\`);
+    XLSX.writeFile(wb, "DeepDive_" + org + "_" + prod + "_" + date + ".xlsx", { bookType: "xlsx", cellStyles: true });
   }
-
   function startScan() {
     if (!orgTags.length || !prodTags.length) return;
     reset();
